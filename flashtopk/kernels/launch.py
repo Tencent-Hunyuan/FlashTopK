@@ -526,6 +526,9 @@ def _compile_decide():
         make_fake_tensor(Float32, (1,)),
         Int32(0),
         Float32(0.0),
+        Int32(0),
+        Float32(0.0),
+        Float32(0.0),
         _stream(),
         options="--enable-tvm-ffi",
     )
@@ -536,13 +539,14 @@ def _estimate_scratch(device_index: int) -> torch.Tensor:
     return torch.empty(1, dtype=torch.float32, device=torch.device("cuda", device_index))
 
 
-def decide(est, ks, ke, scan_ks, prune_ks, flag, threshold: float, estimate=None) -> None:
+def decide(est, ks, ke, scan_ks, prune_ks, flag, threshold: float, estimate=None,
+           keys: int = 0, packed_costs=(0.0, 0.0)) -> None:
     """Adaptive pruning's choice on the device from the estimate rows' sample masks (plan.estimate_shares): flag[0]
-    = (group estimate <= threshold), and the windows for the scan (scan_ks: ke when pruning, else ks) and for the
+    records the choice; set the scan windows (scan_ks: ke when pruning, else ks) and those for the
     pruning kernels (prune_ks: the other way round); estimate[0], when given, receives the group estimate."""
     if estimate is None:
         estimate = _estimate_scratch(ks.device.index)
-    _compile_decide()(est, ks, ke, scan_ks, prune_ks, flag, estimate, ks.shape[0], threshold)
+    _compile_decide()(est, ks, ke, scan_ks, prune_ks, flag, estimate, ks.shape[0], threshold, keys, *packed_costs)
 
 
 @functools.cache

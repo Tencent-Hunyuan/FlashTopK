@@ -17,7 +17,7 @@ import cutlass.utils as utils
 from cutlass import Float32, Int32
 
 from .common import select_i32
-from .simt import THREADS, WARPS
+from .simt import THREADS, WARPS, block_sum_i32
 from .selection import HEALTH_WORDS
 
 
@@ -58,17 +58,20 @@ class Decide:
     @cute.jit
     def __call__(self, est: cute.Tensor, ks: cute.Tensor, ke: cute.Tensor, scan_ks: cute.Tensor,
                  prune_ks: cute.Tensor, flag: cute.Tensor, estimate: cute.Tensor, num_q: Int32, threshold: Float32,
-                 stream: cuda.CUstream):
-        self.kernel(est, ks, ke, scan_ks, prune_ks, flag, estimate, num_q, threshold).launch(
+                 keys: Int32, intercept: Float32, plan_cost: Float32, stream: cuda.CUstream):
+        self.kernel(est, ks, ke, scan_ks, prune_ks, flag, estimate, num_q, threshold, keys,
+                    intercept, plan_cost).launch(
             grid=((num_q + THREADS - 1) // THREADS, 1, 1), block=[THREADS, 1, 1], stream=stream)
 
     @cute.kernel
-    def kernel(self, mEst, mKs, mKe, mScanKs, mPruneKs, mFlag, mEstimate, num_q: Int32, threshold: Float32):
+    def kernel(self, mEst, mKs, mKe, mScanKs, mPruneKs, mFlag, mEstimate, num_q: Int32, threshold: Float32,
+               keys: Int32, intercept: Float32, plan_cost: Float32):
         tid, _, _ = cute.arch.thread_idx()
         bid, _, _ = cute.arch.block_idx()
         smem = utils.SmemAllocator()
         sWin = smem.allocate_tensor(Float32, cute.make_layout((WARPS,)), 16)
         sPass = smem.allocate_tensor(Float32, cute.make_layout((WARPS,)), 16)
+        scratch = smem.allocate_tensor(Int32, cute.make_layout((WARPS,)), 16)
         groups = mEst.layout.shape[0] // EST_GROUP
         half = EST_WORDS // 2
         # Each group's union, its rows' masks or-ed, counted over its in-window samples: the refine's work is a
@@ -100,6 +103,25 @@ class Decide:
         if n_win > Float32(0.0):
             share = n_pass / n_win
         prune = share <= threshold
+        if plan_cost > 0.0 and prune:
+            # Full-context packed requests start at zero, with consecutive causal ends within a request.
+            if mKs[0] == 0 and mKs[num_q - 1] != 0 and mKe[num_q - 1] == keys:
+                width = Int32(0)
+                invalid = Int32(0)
+                for row in cutlass.range(tid, num_q, THREADS, unroll=1):
+                    s, e = mKs[row], mKe[row]
+                    width = width + max(0, min(e, keys) - max(0, s))
+                    if s < 0 or e <= s or e > keys:
+                        invalid = Int32(1)
+                    if row > 0:
+                        prev_s, prev_e = mKs[row - 1], mKe[row - 1]
+                        if not ((s == prev_s and e - 1 == prev_e) or s == prev_e):
+                            invalid = Int32(1)
+                total = block_sum_i32(width, scratch, tid)
+                bad = block_sum_i32(invalid, scratch, tid)
+                if bad == 0 and total > 0:
+                    cutoff = intercept - plan_cost * Float32(num_q) / Float32(total)
+                    prune = share <= min(max(cutoff, Float32(0.0)), Float32(1.0))
         if (bid == 0) & (tid == 0):
             mFlag[0] = select_i32(prune, Int32(1), Int32(0))
             mEstimate[0] = share
