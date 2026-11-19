@@ -265,6 +265,44 @@ def test_group_estimate(dtype, rows):
     assert torch.equal(scan_ks, ke if pruned else ks) and torch.equal(prune_ks, ks if pruned else ke)
 
 
+def test_packed_cost_uses_visible_causal_windows():
+    """The same estimated survival can favor different paths when packed rows see much less KV."""
+    device = torch.device("cuda")
+    rows, keys = 384, 139264
+    # One 8-row estimate group. One quarter of its in-window sample bits survive.
+    est = torch.full((8, 16), -1, device=device, dtype=torch.int32)
+    est[:, 8:] = 0x11111111
+    k_start = torch.full((rows,), 131072, device=device, dtype=torch.int32)
+    k_start[:8] = 0
+    k_end = torch.cat((torch.arange(131065, 131073, device=device, dtype=torch.int32),
+                       torch.arange(keys - rows + 9, keys + 1, device=device, dtype=torch.int32)))
+    flag = torch.empty(1, device=device, dtype=torch.int32)
+    estimate = torch.empty(1, device=device)
+    scan, prune = torch.empty_like(k_start), torch.empty_like(k_start)
+
+    def check(expected):
+        launch.decide(est, k_start, k_end, scan, prune, flag, 0.46, estimate, keys, (0.49, 3559.0))
+        assert bool(flag.item()) == expected
+        assert estimate.item() == 0.25
+        assert torch.equal(scan, k_end if expected else k_start)
+        assert torch.equal(prune, k_start if expected else k_end)
+
+    check(False)
+    k_end[4] -= 1  # Non-causal windows retain the supplied threshold.
+    check(True)
+
+
+def test_packed_cost_retains_threshold_for_long_scan_partitions():
+    from flashtopk import plan
+
+    device = torch.cuda.current_device()
+    if torch.cuda.get_device_name(device) != "NVIDIA H20":
+        pytest.skip("H20 FP8 scan calibration")
+    keys = 131072 + 8192
+    assert plan._packed_costs(device, False, 311, keys) == (0.0, 0.0)
+    assert plan._packed_costs(device, False, 512, keys)[1] > 0.0
+
+
 def test_workspace_bytes():
     sel = flashtopk.Selector(TOPK, dtype=torch.float8_e4m3fn).plan(4096, 131072, warmup=False)
     assert flashtopk.workspace_bytes(4096, 131072) >= sel._arena.numel() * 4

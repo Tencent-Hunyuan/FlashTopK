@@ -29,9 +29,10 @@ all ``EST_GROUP`` rows of a row group once any of them keeps it, so the estimate
 keys whose bound passes the seed gate of some row of their group, pooled over the sampled groups (one in
 ``EST_GROUPS``, at most ``EST_MAX_GROUPS``). Trained rows keep nearly the same keys as their neighbors, untrained
 ones do not, so one row's share says little about its group's: a group's union can be 2-3 times its rows' shares.
-The call prunes when the estimate is at or below ``adaptive_threshold``, where pruning's predicted cost
+The call prunes when the estimate is at or below its cost threshold, where pruning's predicted cost
 (``PRUNE_COSTS``) meets the scan's, otherwise it scans every key. The GPU decides: the estimate never reaches the
-host, both paths launch and the one not taken sees empty windows.
+host, both paths launch and the one not taken sees empty windows. H20 FP8 scans with at most 32K keys per
+KV split use the mean visible window of packed causal requests to amortize per-row plan work.
 """
 
 from __future__ import annotations
@@ -432,17 +433,34 @@ def adaptive_threshold(device_index: int, bf16: bool, seq_len_kv: int) -> float:
     return min(max((1.0 - p * 131072 / seq_len_kv - c) / b, 0.0), 1.0)
 
 
+@functools.lru_cache(maxsize=4096)
+def _packed_costs(device_index: int, bf16: bool, rows: int, keys: int) -> Tuple[float, float]:
+    if bf16 or keys < ADAPTIVE_MIN_KEYS or rows * keys > 2**31 - 1:
+        return 0.0, 0.0
+    props = torch.cuda.get_device_properties(device_index)
+    if props.name != "NVIDIA H20":
+        return 0.0, 0.0
+    # A long serial KV scan in a single CTA can dominate a packed batch's mean row cost.
+    splits = launch.scan_kv_splits(rows, keys, props.multi_processor_count)
+    if keys > 32768 * splits:
+        return 0.0, 0.0
+    p, c, b = prune_costs(device_index, bf16)
+    return (1.0 - c) / b, p * ADAPTIVE_MIN_KEYS / b
+
+
 def adaptive_estimate(q, weights, kv, kv_scales, ks, ke, origin, inv_delta, th_bucket, flag, scan_ks, prune_ks,
                       estimate=None):
     """The plan of the estimate groups' rows, then the GPU's choice: ``flag`` (int32[1]) set when this call's group
-    estimate is at or below ``adaptive_threshold``, ``scan_ks`` / ``prune_ks`` the windows' starts for the scan and
+    estimate is at or below the cost threshold, ``scan_ks`` / ``prune_ks`` the windows' starts for the scan and
     for the pruning kernels (the row's own on the path chosen, past its end on the other); ``estimate`` (FP32[1]),
     when given, receives the estimate. Returns the plan, which ``adaptive_finish`` completes."""
     num_q = q.shape[0]
     plan = _Plan(q, weights, kv, kv_scales, ks, ke, origin, inv_delta, th_bucket)
     plan.rows(num_q, True, None)
     threshold = adaptive_threshold(q.device.index, kv_scales is None, kv.shape[0])
-    launch.decide(plan.est, ks, ke, scan_ks, prune_ks, flag, threshold, estimate)
+    # On an underfilled H20 FP8 scan, per-row plan work is amortized over the visible window.
+    costs = _packed_costs(q.device.index, kv_scales is None, num_q, kv.shape[0])
+    launch.decide(plan.est, ks, ke, scan_ks, prune_ks, flag, threshold, estimate, kv.shape[0], costs)
     return plan
 
 
