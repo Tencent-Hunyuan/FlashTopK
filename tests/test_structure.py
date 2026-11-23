@@ -276,3 +276,47 @@ def test_workspace_bytes():
     without = flashtopk.workspace_bytes(4096, 131072)
     assert without == flashtopk.workspace_bytes(4096, 131072, return_scores=True) + 4096 * TOPK * 4
     assert without >= (sel._arena.numel() + sel._scores.numel()) * 4
+
+
+def test_multistream_select_isolation():
+    """flashtopk.select() keeps separate workspaces per CUDA stream so concurrent streams stay bit-exact."""
+    c1 = make_call(256, 16000, torch.float8_e4m3fn, seed=51, windows="random")
+    c2 = make_call(256, 16000, torch.float8_e4m3fn, seed=52, windows="random")
+    q1, kv1, s1_sc, w1, ks1, ke1 = c1
+    q2, kv2, s2_sc, w2, ks2, ke2 = c2
+    ref1, ref2 = reference(c1), reference(c2)
+    s1, s2 = torch.cuda.Stream(), torch.cuda.Stream()
+    s1.wait_stream(torch.cuda.current_stream())
+    s2.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s1):
+        out1 = flashtopk.select(q1, kv1, w1, ks1, ke1, s1_sc, topk=TOPK, pruning="off", return_scores=True)
+    with torch.cuda.stream(s2):
+        out2 = flashtopk.select(q2, kv2, w2, ks2, ke2, s2_sc, topk=TOPK, pruning="off", return_scores=True)
+    torch.cuda.synchronize()
+    assert_same(out1, ref1)
+    assert_same(out2, ref2)
+
+
+def test_cuda_graph_select_capture_isolation():
+    """flashtopk.select() creates a dedicated workspace during CUDA graph capture and replays bit-exactly."""
+    c1 = make_call(256, 16000, torch.float8_e4m3fn, seed=53, windows="random")
+    c2 = make_call(256, 16000, torch.float8_e4m3fn, seed=54, windows="random")
+    q1, kv1, s1_sc, w1, ks1, ke1 = c1
+    q2, kv2, s2_sc, w2, ks2, ke2 = c2
+    static = [t.clone() for t in (q1, kv1, w1, ks1, ke1, s1_sc)]
+    out = (torch.empty(256, TOPK, device="cuda"), torch.empty(256, TOPK, dtype=torch.int32, device="cuda"))
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        flashtopk.select(*static, topk=TOPK, pruning="off", out=out, return_scores=True)
+    torch.cuda.current_stream().wait_stream(side)
+    n_cached = len(topk_mod._SELECTORS.selectors)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        flashtopk.select(*static, topk=TOPK, pruning="off", out=out, return_scores=True)
+    assert len(topk_mod._SELECTORS.selectors) == n_cached
+    for dst, src in zip(static, (q2, kv2, w2, ks2, ke2, s2_sc)):
+        dst.copy_(src)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert_same(out, reference(c2))

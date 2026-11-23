@@ -15,8 +15,9 @@ See the [README](../README.md) for the score, installation and a first call.
 flashtopk.select(q, kv, weights, ks, ke, kv_scales=None, topk=2048, pruning=None, out=None, chunk_size=None,
                  return_scores=False) -> indices, or (scores, indices)
 """Each query row's top-k keys under the indexer score.
-Keeps one Selector per (device, dtype, topk, pruning, chunk_size, return_scores); its workspace grows to the largest
-call seen.
+Keeps one Selector per host thread, CUDA stream and (device, dtype, topk, pruning, chunk_size, return_scores);
+its workspace grows to the largest call seen. During CUDA graph capture a fresh Selector is created so concurrent
+graph replays cannot share mutable workspace.
 
 Arguments:
     q: (num_q, 32, 128), torch.float8_e4m3fn or torch.bfloat16. The indexer queries.

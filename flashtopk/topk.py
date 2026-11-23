@@ -24,6 +24,7 @@ from __future__ import annotations
 import dataclasses
 import math
 import os
+import threading
 from typing import Optional, Tuple, Union
 
 import torch
@@ -228,6 +229,9 @@ class Selector:
             raise ValueError(f"weights must be float32 [{num_q}, 32], got {weights.dtype} {tuple(weights.shape)}")
         if ks.shape != (num_q,) or ke.shape != (num_q,):
             raise ValueError(f"ks and ke must be [{num_q}], got {tuple(ks.shape)} and {tuple(ke.shape)}")
+        if any(x.device != self.device for x in (weights, ks, ke)) or (
+                kv_scales is not None and kv_scales.device != self.device):
+            raise ValueError("weights, windows and scales must reside on the selector device")
         fp8 = self.dtype == torch.float8_e4m3fn
         if fp8 and (kv_scales is None or kv_scales.numel() != kv.shape[0] or kv_scales.dtype != torch.float32):
             raise ValueError(f"FP8 keys need float32 kv_scales of {kv.shape[0]} elements")
@@ -339,18 +343,31 @@ class Selector:
         return health, pruned, estimate
 
 
-_SELECTORS: dict = {}
+class _SelectorCache(threading.local):
+    # Two host threads can interleave the kernels of their calls even on the same CUDA stream.
+    def __init__(self):
+        self.selectors = {}
+
+
+_SELECTORS = _SelectorCache()
 
 
 def select(q: torch.Tensor, kv: torch.Tensor, weights: torch.Tensor, ks: torch.Tensor, ke: torch.Tensor,
            kv_scales: Optional[torch.Tensor] = None, topk: int = 2048, pruning: Optional[str] = None,
            out: Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor, None] = None, chunk_size: Optional[int] = None,
            return_scores: bool = False) -> Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
-    """Selector(...).run(...) with a selector kept per (device, dtype, topk, pruning, chunk_size, return_scores), its
-    workspace grown to the largest call seen."""
-    key = (q.device, q.dtype, topk, pruning, chunk_size, return_scores)
-    selector = _SELECTORS.get(key)
+    """Selector(...).run(...) with a growing workspace per host thread, CUDA stream and configuration."""
+    if not q.is_cuda:
+        raise ValueError("FlashTopK requires CUDA queries")
+    with torch.cuda.device(q.device):
+        capturing = torch.cuda.is_current_stream_capturing()
+        stream = torch.cuda.current_stream().cuda_stream
+    key = (q.device, stream, q.dtype, topk, pruning, chunk_size, return_scores)
+    # Captured graphs can replay on any stream, including concurrently with their original capture stream.
+    selector = None if capturing else _SELECTORS.selectors.get(key)
     if selector is None:
-        selector = _SELECTORS[key] = Selector(topk, dtype=q.dtype, device=q.device, pruning=pruning,
-                                              chunk_size=chunk_size, return_scores=return_scores)
+        selector = Selector(topk, dtype=q.dtype, device=q.device, pruning=pruning,
+                            chunk_size=chunk_size, return_scores=return_scores)
+        if not capturing:
+            _SELECTORS.selectors[key] = selector
     return selector.run(q, kv, weights, ks, ke, kv_scales, out)

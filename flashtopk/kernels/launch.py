@@ -16,6 +16,7 @@ import contextlib
 import contextvars
 import functools
 import math
+import threading
 from typing import Optional, Tuple
 
 import cutlass
@@ -95,13 +96,29 @@ def arch(t: torch.Tensor) -> int:
     return torch.cuda.get_device_capability(t.device)[0]
 
 
-@functools.cache
+def stream_tensor_cache(build):
+    """Cache tensors on their producing CUDA stream. A capture must own the operations that initialize its tensors."""
+    @functools.lru_cache(maxsize=64)
+    def cached(thread, stream_id, device_index, *args):
+        return build(device_index, *args)
+
+    @functools.wraps(build)
+    def get(device_index, *args):
+        with torch.cuda.device(device_index):
+            if torch.cuda.is_current_stream_capturing():
+                return build(device_index, *args)
+            return cached(threading.current_thread(), torch.cuda.current_stream().cuda_stream, device_index, *args)
+
+    return get
+
+
+@stream_tensor_cache
 def _ones(device_index: int, n: int) -> torch.Tensor:
     return torch.ones(n, dtype=torch.float32, device=torch.device("cuda", device_index))
 
 
 def unit_scales(kv: torch.Tensor) -> torch.Tensor:
-    """BF16 keys have no scale: ones (x * 1.0 is exact), in a buffer kept per device and grown in powers of two."""
+    """BF16 keys have no scale: ones (x * 1.0 is exact), cached per stream and grown in powers of two."""
     n = max(4096, 1 << (kv.shape[0] - 1).bit_length())
     return _ones(kv.device.index, n)
 
@@ -472,8 +489,8 @@ def prune_refine(q, kv, kv_scales, knsc, weights, mask, ks, ke, origin, inv_delt
     run(q, kv, kv_scales, knsc, weights, mask, ks, ke, origin, inv_delta, th_bucket, cand_val, cand_idx, cand_cnt)
 
 
-@functools.lru_cache(maxsize=64)
-def _sample_positions(seq_len_kv: int, num_samples: int, device_index: int) -> torch.Tensor:
+@stream_tensor_cache
+def _sample_positions(device_index: int, seq_len_kv: int, num_samples: int) -> torch.Tensor:
     """The shared sample's keys p_j = floor((2j + 1) L / (2M)), int64."""
     j = torch.arange(num_samples, device=torch.device("cuda", device_index), dtype=torch.int64)
     return torch.div((2 * j + 1) * seq_len_kv, 2 * num_samples, rounding_mode="floor")
@@ -504,7 +521,7 @@ def sample_scores(q, kv, kv_scales, weights, ks, ke, num_samples: int, out: torc
     the call's health zeroed, in the same launch), then every row's sample scores out[r, lo[r]:hi[r]] by the dense
     scan (the scan's bits, so calibration needs no seed margin)."""
     seq_len_kv = kv.shape[0]
-    pos = _sample_positions(seq_len_kv, num_samples, kv.device.index)
+    pos = _sample_positions(kv.device.index, seq_len_kv, num_samples)
     kv_sample = as_operand(kv).index_select(0, pos).view(kv.dtype)
     scales = None if kv_scales is None else kv_scales.index_select(0, pos)
     _compile_sample_windows()(ks, ke, lo, hi, health, q.shape[0], seq_len_kv, num_samples)
@@ -531,7 +548,7 @@ def _compile_decide():
     )
 
 
-@functools.cache
+@stream_tensor_cache
 def _estimate_scratch(device_index: int) -> torch.Tensor:
     return torch.empty(1, dtype=torch.float32, device=torch.device("cuda", device_index))
 
@@ -701,4 +718,4 @@ def supported(q: torch.Tensor, kv: Optional[torch.Tensor] = None) -> bool:
         return False
     if q.dtype not in (torch.float8_e4m3fn, torch.bfloat16) or arch(q) not in (9, 10):
         return False
-    return kv is None or (kv.dim() == 2 and kv.shape[1] == HEAD_DIM and kv.dtype == q.dtype)
+    return kv is None or (kv.dim() == 2 and kv.shape[1] == HEAD_DIM and kv.dtype == q.dtype and kv.device == q.device)

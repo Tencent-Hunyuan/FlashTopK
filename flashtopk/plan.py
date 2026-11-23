@@ -289,8 +289,8 @@ def key_norms(plan, kv: torch.Tensor, flag: Optional[torch.Tensor] = None) -> No
                               HAS_SCALES=plan.kv_scales is not None)
 
 
-@functools.lru_cache(maxsize=64)
-def _plan_sample_cols(nk: int, device_index: int) -> Tuple[torch.Tensor, torch.Tensor]:
+@launch.stream_tensor_cache
+def _plan_sample_cols(device_index: int, nk: int) -> Tuple[torch.Tensor, torch.Tensor]:
     """The plan's sample keys, int32 and int64: (2j + 1) nk // (2 S) for j < S."""
     cols = (2 * torch.arange(_PLAN_SAMPLES, device=torch.device("cuda", device_index)) + 1) * nk // (2 * _PLAN_SAMPLES)
     return cols.to(torch.int32), cols
@@ -317,7 +317,7 @@ class _Plan:
             th_bucket = torch.zeros(num_q, dtype=torch.int32, device=dev)
         # Padded to 4 floats, as the TMA of every per-key vector reads.
         self.knsc = torch.empty((nk + 3) // 4 * 4, dtype=torch.float32, device=dev)
-        self.cols, picked = _plan_sample_cols(nk, dev.index)
+        self.cols, picked = _plan_sample_cols(dev.index, nk)
         self.k_samples = kv[picked].contiguous()
         self.bf16 = kv_scales is None
         if self.bf16:
