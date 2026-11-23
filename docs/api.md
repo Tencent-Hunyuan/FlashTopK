@@ -50,11 +50,10 @@ num_heads: must be 32. dtype: torch.float8_e4m3fn or torch.bfloat16. device: def
 """
 
 selector.plan(max_rows, max_kv, warmup=True) -> Selector
-"""Allocates the workspace for calls of up to max_rows query rows over max_kv keys: about
-8 * min(max_rows, chunk_size) * max(4 * topk, 16384) bytes, plus a slice's scores (4 * min(max_rows, chunk_size) *
-topk bytes) unless return_scores. flashtopk.workspace_bytes(max_rows, max_kv, topk, chunk_size, return_scores) gives it.
-With warmup, compiles every CuTe kernel variant these calls can take.
-Optional: run() grows the plan when a call is larger.
+"""Allocates the workspace for calls of up to max_rows query rows over max_kv keys.
+flashtopk.workspace_bytes(max_rows, max_kv, topk, chunk_size, return_scores) gives its size (candidate buffers scale
+with topk and are clamped to aligned max_kv). With warmup, compiles every CuTe kernel variant these calls can take.
+Optional: run() grows the plan geometrically when a call is larger.
 """
 
 selector.run(q, kv, weights, ks, ke, kv_scales=None, out=None) -> indices, or (scores, indices)

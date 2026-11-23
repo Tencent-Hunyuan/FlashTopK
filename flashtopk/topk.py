@@ -57,17 +57,23 @@ def sample_count(seq_len_kv: int) -> int:
 
 
 def candidate_cap(topk: int, num_q: int, seq_len_kv: int) -> int:
-    """Candidate slots per row. The scan tightens each row's gate as it goes, which takes a wave of row tiles: calls
-    of fewer rows keep their sampled gates longer and get more slots, as do calls past 1M keys, whose steady state
-    alone nears 16K candidates."""
-    cap = max(4 * topk, 16384)
+    """Candidate slots per row, scaled with topk and the K_MIN sampling floor, never larger than the aligned KV
+    length. Calls of fewer rows keep their sampled gates longer and get more slots, as do calls past 1M keys."""
+    cap = max(8 * topk, 4096) if topk <= 1024 else max(4 * topk, 16384)
+    if seq_len_kv > 0:
+        m = sample_count(seq_len_kv)
+        if m < seq_len_kv:
+            kmin_floor = (2 * ((K_MIN * seq_len_kv + m - 1) // m) + 255) // 256 * 256
+            cap = max(cap, kmin_floor)
     if seq_len_kv > 1024 * 1024:
-        cap = max(cap, 32768)
+        cap = max(cap, 16384 if topk <= 1024 else 32768)
     if num_q < 128:
         extrapolated = (seq_len_kv * topk + 2 * SAMPLE_LEN - 1) // (2 * SAMPLE_LEN)
         cap = max(cap, (cap + extrapolated + 255) // 256 * 256)
     elif num_q < 1024:
-        cap = max(cap, 32768)
+        cap = max(cap, 16384 if topk <= 1024 else 32768)
+    if seq_len_kv > 0:
+        cap = min(cap, max(256, (seq_len_kv + 255) // 256 * 256))
     return cap
 
 
@@ -81,6 +87,8 @@ def workspace_bytes(max_rows: int, max_kv: int, topk: int = 2048, chunk_size: Op
     """Device memory a Selector planned for (max_rows, max_kv) holds, about: dominated by the candidate buffers
     (2 * 4 bytes * rows * candidate_cap), for at most chunk_size rows, plus a slice's scores without return_scores."""
     max_rows = min(max_rows, chunk_size or DEFAULT_CHUNK_SIZE)
+    if max_rows == 0:
+        return 0
     rows = [r for r in (max_rows, min(max_rows, 1023), min(max_rows, 127)) if r > 0]
     arena = max(_arena_elements(r, max_kv, topk) for r in rows) * 4
     scores = 0 if return_scores else max_rows * topk * 4
@@ -188,30 +196,43 @@ class Selector:
             launch.warmup(torch.cuda.get_device_capability(self.device)[0], self.dtype == torch.bfloat16, self.topk,
                           words_per_head)
         max_rows = min(max_rows, self.chunk_size)
-        max_rows, max_kv = max(max_rows, self.max_rows), max(max_kv, self.max_kv)
-        if max_rows == self.max_rows and max_kv == self.max_kv and self._arena is not None:
+        if max_rows == 0:
             return self
+        if self._arena is not None and max_rows <= self.max_rows and max_kv <= self.max_kv:
+            return self
+        grow_rows = self._arena is None or max_rows > self.max_rows
+        if self._arena is not None and max_kv > self.max_kv:
+            # Geometric growth avoids reallocating workspaces on every chunk of a growing prefill.
+            max_kv = max(max_kv, 2 * self.max_kv)
+        max_rows, max_kv = max(max_rows, self.max_rows), max(max_kv, self.max_kv)
         dev = self.device
         rows = [r for r in (max_rows, min(max_rows, 1023), min(max_rows, 127)) if r > 0]
         elements = max(_arena_elements(r, max_kv, self.topk) for r in rows)
         i32 = dict(dtype=torch.int32, device=dev)
-        self._arena = torch.empty(elements, dtype=torch.float32, device=dev)
-        self._origin = torch.empty(max_rows, dtype=torch.float32, device=dev)
-        self._inv_delta = torch.empty(max_rows, dtype=torch.float32, device=dev)
-        self._th_bucket = torch.empty(max_rows, **i32)
-        self._cand_cnt = torch.empty(max_rows, **i32)
-        self._lo = torch.empty(max_rows, **i32)
-        self._hi = torch.empty(max_rows, **i32)
-        self._scan_ks = torch.empty(max_rows, **i32)
-        self._prune_ks = torch.empty(max_rows, **i32)
-        self._flag = torch.zeros(1, **i32)
-        self._estimate = torch.zeros(1, dtype=torch.float32, device=dev)
-        self._health = torch.zeros(HEALTH_WORDS, dtype=torch.int64, device=dev)
-        self._call_health = torch.zeros(HEALTH_WORDS, dtype=torch.int64, device=dev)
-        self._call_pruned = torch.zeros(1, **i32)
-        self._bad_rows = torch.zeros(RECOVERY_ROWS, **i32)
-        self._scores = None if self.return_scores else torch.empty(max_rows, self.topk, dtype=torch.float32, device=dev)
-        self._recovery = Recovery(max_rows, max_kv, self.topk, self.dtype, self._arena)
+        if self._arena is None or elements > self._arena.numel():
+            self._arena = torch.empty(elements, dtype=torch.float32, device=dev)
+            grow_recovery = True
+        else:
+            grow_recovery = self._recovery is None or max_kv > self.max_kv
+        if grow_rows:
+            self._origin = torch.empty(max_rows, dtype=torch.float32, device=dev)
+            self._inv_delta = torch.empty(max_rows, dtype=torch.float32, device=dev)
+            self._th_bucket = torch.empty(max_rows, **i32)
+            self._cand_cnt = torch.empty(max_rows, **i32)
+            self._lo = torch.empty(max_rows, **i32)
+            self._hi = torch.empty(max_rows, **i32)
+            self._scan_ks = torch.empty(max_rows, **i32)
+            self._prune_ks = torch.empty(max_rows, **i32)
+            self._flag = torch.zeros(1, **i32)
+            self._estimate = torch.zeros(1, dtype=torch.float32, device=dev)
+            self._health = torch.zeros(HEALTH_WORDS, dtype=torch.int64, device=dev)
+            self._call_health = torch.zeros(HEALTH_WORDS, dtype=torch.int64, device=dev)
+            self._call_pruned = torch.zeros(1, **i32)
+            self._bad_rows = torch.zeros(RECOVERY_ROWS, **i32)
+            self._scores = None if self.return_scores else torch.empty(max_rows, self.topk, dtype=torch.float32, device=dev)
+            grow_recovery = True
+        if grow_recovery:
+            self._recovery = Recovery(max_rows, max_kv, self.topk, self.dtype, self._arena)
         self.max_rows, self.max_kv = max_rows, max_kv
         return self
 
@@ -245,8 +266,6 @@ class Selector:
         self._check(q, kv, weights, ks, ke, kv_scales)
         num_q, seq_len_kv = q.shape[0], kv.shape[0]
         rows = min(num_q, self.chunk_size)
-        if rows > self.max_rows or seq_len_kv > self.max_kv:
-            self.plan(rows, seq_len_kv, warmup=False)
         topk = self.topk
         if out is None:
             scores = torch.empty(num_q, topk, dtype=torch.float32, device=q.device) if self.return_scores else None
@@ -254,8 +273,14 @@ class Selector:
         else:
             scores, indices = out if self.return_scores else (None, out)
         result = (scores, indices) if self.return_scores else indices
-        if num_q == 0:
+        if num_q == 0 or seq_len_kv == 0:
+            indices.fill_(-1)
+            if scores is not None:
+                scores.fill_(float("-inf"))
+            self.last_info = Info(torch.zeros(HEALTH_WORDS, dtype=torch.int64, device=q.device), False)
             return result
+        if rows > self.max_rows or seq_len_kv > self.max_kv:
+            self.plan(rows, seq_len_kv, warmup=False)
         q, kv, weights = q.contiguous(), kv.contiguous(), weights.contiguous()
         ks = ks.to(torch.int32).contiguous()
         ke = ke.to(torch.int32).contiguous()

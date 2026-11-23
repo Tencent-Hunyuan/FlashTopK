@@ -276,3 +276,35 @@ def test_workspace_bytes():
     without = flashtopk.workspace_bytes(4096, 131072)
     assert without == flashtopk.workspace_bytes(4096, 131072, return_scores=True) + 4096 * TOPK * 4
     assert without >= (sel._arena.numel() + sel._scores.numel()) * 4
+    assert flashtopk.workspace_bytes(0, 131072) == 0
+
+
+def test_candidate_cap_and_geometric_growth():
+    """candidate_cap scales down for smaller topk and clamps to aligned KV; plan() grows max_kv geometrically."""
+    assert topk_mod.candidate_cap(512, 4096, 32768) < topk_mod.candidate_cap(2048, 4096, 32768)
+    assert topk_mod.candidate_cap(2048, 4096, 4096) == 4096
+    assert flashtopk.workspace_bytes(4096, 8192, 2048) < flashtopk.workspace_bytes(4096, 32768, 2048)
+    sel = flashtopk.Selector(TOPK, dtype=torch.float8_e4m3fn).plan(256, 8192, warmup=False)
+    assert sel.max_kv == 8192
+    sel.plan(256, 12288, warmup=False)
+    assert sel.max_kv == 16384
+    arena_ptr = sel._arena.data_ptr()
+    sel.plan(256, 16384, warmup=False)
+    assert sel._arena.data_ptr() == arena_ptr
+
+    # Smaller topk over long KV stays exact without overflowing candidate buffers.
+    q, kv, s, w, ks, ke = make_call(128, 32768, torch.float8_e4m3fn, seed=55, windows="random")
+    sel512 = flashtopk.Selector(512, dtype=torch.float8_e4m3fn, pruning="off", return_scores=True)
+    got = sel512.run(q, kv, w, ks, ke, s)
+    assert sel512.last_info.bad_rows == 0
+    assert_same(got, canonical_topk(dense_scores(q, kv, s, w, ks, ke), 512))
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_empty_kv(dtype):
+    """Empty KV returns (-inf, -1) safely without touching kernels or failing plan()."""
+    q, kv, s, w, ks, ke = make_call(32, 128, dtype, seed=56)
+    sel = flashtopk.Selector(TOPK, dtype=dtype, return_scores=True)
+    scores, idx = sel.run(q, kv[:0], w, torch.zeros_like(ks), torch.zeros_like(ke), None if s is None else s[:0])
+    assert bool((idx == -1).all()) and bool(torch.isneginf(scores).all())
+    assert sel.last_info.bad_rows == 0
