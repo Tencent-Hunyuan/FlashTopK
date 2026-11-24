@@ -19,16 +19,17 @@
 kernels.
 
 The structure of scan_sm100.py (its warp roles, per-warpgroup KV rings and TMEM accumulators, overlapped TMEM
-subtiles) on 16-row tiles of the pruning operand (plan.py plans it): per 128-key block one M=128, N=256 MMA gives
-every row's 16 pruning columns -- 14 retained heads and the high and low FP8 rows of the negative aggregate --
-in pair order (rows 2p and 2p + 1 interleaved by column), so a thread's TMEM columns hold a pair's values side by
-side for packed FP32 arithmetic. The bound, in this order of operations,
+subtiles) on 16-row (16-col) or 8-row (24-col) tiles of the pruning operand (plan.py plans it): per 128-key block one
+M=128, N=256 (16-col) or N=192 (24-col) MMA gives every row's pruning columns -- R = cols - 2 retained heads and the
+high and low rows of the negative aggregate -- in pair order (rows 2p and 2p + 1 interleaved by column), so a
+thread's TMEM columns hold a pair's values side by side for packed FP32 arithmetic. The bound, in this order of
+operations,
 
-    s_k * (sum_{c < 14} (x_c + |x_c|) (w_c / 2) - relu(x_14 w_14 + x_15 w_15)) + allowance * (s_k ||k||),
+    s_k * (sum_{c < R} (x_c + |x_c|) (w_c / 2) - relu(x_R w_R + x_{R+1} w_{R+1})) + allowance * (s_k ||k||),
 
-against the row's raw gate (and window off the interior) sets, per 8-row half and key, whether any of the half's
-rows keeps it: mask[2 * tile + half][block][4], one bit per key, every word of the tile's KV range written.
-refine_sm100.py scores those keys in full.
+against the row's raw gate (and window off the interior) sets, per 8-row refine group and key, whether any of the
+group's rows keeps it: mask[halves * tile + half][block][4], one bit per key, every word of the tile's KV range
+written. refine_sm100.py scores those keys in full.
 
 Warp roles (384 threads): warps 0-7 two math warpgroups (group w the blocks 2i + w), warps 8-9 TMA (Q and weights
 once; group w's KV, scales and key norms), warp 10 UMMA.
@@ -50,21 +51,26 @@ from .common import abs_f32, fmax, loose_raw_gate, select_i32, store_global_b32
 from .scan_sm100 import _RND_RN, named_barrier_sync_unaligned
 
 BLOCK_KV = 128
-BLOCK_Q = 16
 COLS = 16
 HEAD_DIM = 128
 NUM_KV_STAGES = 3
-NUM_EPI_SUBTILES = 4  # 64 columns: two row pairs
-PAIR_FLOATS = 2 * COLS + 4  # the pair's weights by column, allowances, gates
+NUM_EPI_SUBTILES = 4
 NUM_MATH_WG = 2
 
 
 class PruneSm100:
-    def __init__(self, *, bf16: bool = False):
+    def __init__(self, *, bf16: bool = False, cols: int = COLS):
+        assert cols in (16, 24), f"PruneSm100 supports 16 or 24 columns, got {cols}"
         self.bf16 = bf16
+        self.cols = cols
+        # 16 rows x 16 cols = 256 (2 refine groups of 8 rows); 8 rows x 24 cols = 192 (1 refine group of 8 rows).
+        self.block_q = 8 if cols == 24 else 16
+        self.halves = self.block_q // 8
+        self.pairs_per_subtile = self.block_q // 2 // NUM_EPI_SUBTILES
+        self.pair_floats = 2 * cols + 4
         # A BF16 KV stage is twice an FP8 one: two stages per ring keep shared memory under 227 KB.
         self.num_kv_stages = 2 if bf16 else NUM_KV_STAGES
-        self.N = BLOCK_Q * COLS
+        self.N = self.block_q * self.cols
         self.num_math_threads = 256
         self.threads_per_cta = 384
         self.math_wg_registers = 216
@@ -108,10 +114,12 @@ class PruneSm100:
         th_bucket: cute.Tensor,
         allowance: cute.Tensor,  # [num_q] f32
         mask: cute.Tensor,  # [2 * tiles * mask_blocks * 4] i32
+        flag: cute.Tensor,  # [1] i32: adaptive choice flag (ignored when expected_flag == 0)
         num_q: Int32,
         seq_len_kv: Int32,
         mask_blocks: Int32,
         num_splits: Int32,
+        expected_flag: Int32,  # 0: always run; >0: run iff flag[0] == expected_flag
         stream: cuda.CUstream,
     ):
         if cutlass.const_expr(self.bf16):
@@ -136,15 +144,15 @@ class PruneSm100:
             sm100_utils.cluster_shape_to_tma_atom_B(self.cluster_shape_mn, tiled_mma.thr_id),
             b, b_smem_layout, self.mma_tiler, tiled_mma, self.cluster_layout_vmnk.shape,
         )
-        w_layout = cute.make_layout((BLOCK_Q, COLS), stride=(COLS, 1))
-        tma_atom_w, tma_tensor_w = cpasync.make_tiled_tma_atom(tma_load_op, w_prune, w_layout, (BLOCK_Q, COLS))
+        w_layout = cute.make_layout((self.block_q, self.cols), stride=(self.cols, 1))
+        tma_atom_w, tma_tensor_w = cpasync.make_tiled_tma_atom(tma_load_op, w_prune, w_layout, (self.block_q, self.cols))
         tma_atom_s, tma_tensor_s = cpasync.make_tiled_tma_atom(
             tma_load_op, kv_scales, cute.make_layout((BLOCK_KV,)), (BLOCK_KV,)
         )
         tma_atom_n, tma_tensor_n = cpasync.make_tiled_tma_atom(
             tma_load_op, knsc, cute.make_layout((BLOCK_KV,)), (BLOCK_KV,)
         )
-        self.num_q_tma_bytes = cute.size_in_bytes(b.element_type, b_smem_layout) + BLOCK_Q * COLS * 4
+        self.num_q_tma_bytes = cute.size_in_bytes(b.element_type, b_smem_layout) + self.block_q * self.cols * 4
         self.num_kv_tma_bytes = BLOCK_KV * HEAD_DIM * (a.element_type.width // 8) + 2 * BLOCK_KV * 4
 
         @cute.struct
@@ -154,12 +162,12 @@ class PruneSm100:
             umma_mbar: cute.struct.MemRange[cutlass.Int64, 4]
             tmem_holding_buf: Int32
 
-        num_tiles = (num_q + BLOCK_Q - 1) // BLOCK_Q
+        num_tiles = (num_q + self.block_q - 1) // self.block_q
         self.kernel(
             tiled_mma, tma_atom_a, tma_tensor_a, tma_atom_b, tma_tensor_b, tma_atom_w, tma_tensor_w, tma_atom_s,
             tma_tensor_s, tma_atom_n, tma_tensor_n, row_start, row_end, origin, inv_delta, th_bucket, allowance, mask,
-            num_q, seq_len_kv, mask_blocks, num_splits, self.cluster_layout_vmnk, self.a_smem_layout_staged,
-            self.b_smem_layout_staged, w_layout, self.epi_tile, SharedStorage,
+            flag, num_q, seq_len_kv, mask_blocks, num_splits, expected_flag, self.cluster_layout_vmnk,
+            self.a_smem_layout_staged, self.b_smem_layout_staged, w_layout, self.epi_tile, SharedStorage,
         ).launch(
             grid=(num_tiles, num_splits, 1),
             block=[self.threads_per_cta, 1, 1],
@@ -189,10 +197,12 @@ class PruneSm100:
         mThBucket: cute.Tensor,
         mAllowance: cute.Tensor,
         mMask: cute.Tensor,
+        mFlag: cute.Tensor,
         num_q: Int32,
         seq_len_kv: Int32,
         mask_blocks: Int32,
         num_splits: Int32,
+        expected_flag: Int32,
         cluster_layout_vmnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
         b_smem_layout_staged: cute.ComposedLayout,
@@ -206,10 +216,12 @@ class PruneSm100:
         gdimx, _, _ = cute.arch.grid_dim()
         warpgroup_idx = warp_idx // 4
         tile = gdimx - 1 - bidx  # longest windows first
-        query_start = tile * BLOCK_Q
+        query_start = tile * self.block_q
 
-        # The CTA's KV range (the rows' windows clipped to the split, from a 128-key boundary: mask blocks are
-        # global) and the range every row covers.
+        # Skip per-row window loads when adaptive pruning chose another branch.
+        flag_ok = expected_flag == Int32(0)
+        if expected_flag != Int32(0):
+            flag_ok = mFlag[0] == expected_flag
         total_blocks = (seq_len_kv + BLOCK_KV - 1) // BLOCK_KV
         blocks_per_split = (total_blocks + num_splits - 1) // num_splits
         split_lo = bidy * blocks_per_split * BLOCK_KV
@@ -218,206 +230,208 @@ class PruneSm100:
         range_hi = Int32(0)
         cover_lo = Int32(0)
         cover_hi = seq_len_kv
-        for r in cutlass.range_constexpr(BLOCK_Q):
-            row = query_start + r
-            s = seq_len_kv
-            e = Int32(0)
-            if row < num_q:
-                s = max(min(mRowStart[row], seq_len_kv), split_lo)
-                e = min(min(mRowEnd[row], seq_len_kv), split_hi)
-            nonempty = e > s
-            range_lo = min(range_lo, select_i32(nonempty, s, seq_len_kv))
-            range_hi = max(range_hi, select_i32(nonempty, e, 0))
-            cover_lo = max(cover_lo, select_i32(nonempty, s, seq_len_kv))
-            cover_hi = min(cover_hi, select_i32(nonempty, e, 0))
-        has_work = range_hi > range_lo
-        kv_start = range_lo // BLOCK_KV * BLOCK_KV
-        num_kv = Int32(0)
+        has_work = cutlass.Boolean(False)
+        if flag_ok:
+            for r in cutlass.range_constexpr(self.block_q):
+                row = query_start + r
+                s = seq_len_kv
+                e = Int32(0)
+                if row < num_q:
+                    s = max(min(mRowStart[row], seq_len_kv), split_lo)
+                    e = min(min(mRowEnd[row], seq_len_kv), split_hi)
+                nonempty = e > s
+                range_lo = min(range_lo, select_i32(nonempty, s, seq_len_kv))
+                range_hi = max(range_hi, select_i32(nonempty, e, 0))
+                cover_lo = max(cover_lo, select_i32(nonempty, s, seq_len_kv))
+                cover_hi = min(cover_hi, select_i32(nonempty, e, 0))
+            has_work = range_hi > range_lo
+        # Empty CTAs (unused adaptive branch) exit before mbarrier/TMEM setup.
         if has_work:
+            kv_start = range_lo // BLOCK_KV * BLOCK_KV
             num_kv = (range_hi - kv_start + BLOCK_KV - 1) // BLOCK_KV
-        num_pairs = (num_kv + NUM_MATH_WG - 1) // NUM_MATH_WG
+            num_pairs = (num_kv + NUM_MATH_WG - 1) // NUM_MATH_WG
 
-        if (warp_idx == 8) | (warp_idx == 9):
-            for atom in (tma_atom_a, tma_atom_b, tma_atom_w, tma_atom_s, tma_atom_n):
-                cpasync.prefetch_descriptor(atom)
+            if (warp_idx == 8) | (warp_idx == 9):
+                for atom in (tma_atom_a, tma_atom_b, tma_atom_w, tma_atom_s, tma_atom_n):
+                    cpasync.prefetch_descriptor(atom)
 
-        smem = utils.SmemAllocator()
-        storage = smem.allocate(SharedStorage)
-        prod_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
-        q_pipeline = pipeline.PipelineTmaAsync.create(
-            barrier_storage=storage.q_mbar.data_ptr(), num_stages=1, producer_group=prod_group,
-            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 8), tx_count=self.num_q_tma_bytes,
-            cta_layout_vmnk=cluster_layout_vmnk, tidx=tidx, defer_sync=True,
-        )
-        kv_cons_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, 4)
-        kv_pipes = [
-            pipeline.PipelineTmaAsync.create(
-                barrier_storage=storage.kv_mbar.data_ptr() + g * self.num_kv_stages * 2, num_stages=self.num_kv_stages,
+            smem = utils.SmemAllocator()
+            storage = smem.allocate(SharedStorage)
+            prod_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
+            q_pipeline = pipeline.PipelineTmaAsync.create(
+                barrier_storage=storage.q_mbar.data_ptr(), num_stages=1, producer_group=prod_group,
+                consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 8), tx_count=self.num_q_tma_bytes,
+                cta_layout_vmnk=cluster_layout_vmnk, tidx=tidx, defer_sync=True,
+            )
+            kv_cons_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, 4)
+            kv_pipes = [
+                pipeline.PipelineTmaAsync.create(
+                    barrier_storage=storage.kv_mbar.data_ptr() + g * self.num_kv_stages * 2, num_stages=self.num_kv_stages,
+                    producer_group=prod_group, consumer_group=kv_cons_group, tx_count=self.num_kv_tma_bytes,
+                    cta_layout_vmnk=cluster_layout_vmnk, tidx=tidx, defer_sync=True,
+                )
+                for g in range(2)
+            ]
+            math_ring = min(warpgroup_idx, Int32(1))
+            kv_pipeline_math = pipeline.PipelineTmaAsync.create(
+                barrier_storage=storage.kv_mbar.data_ptr() + math_ring * self.num_kv_stages * 2, num_stages=self.num_kv_stages,
                 producer_group=prod_group, consumer_group=kv_cons_group, tx_count=self.num_kv_tma_bytes,
                 cta_layout_vmnk=cluster_layout_vmnk, tidx=tidx, defer_sync=True,
             )
-            for g in range(2)
-        ]
-        math_ring = min(warpgroup_idx, Int32(1))
-        kv_pipeline_math = pipeline.PipelineTmaAsync.create(
-            barrier_storage=storage.kv_mbar.data_ptr() + math_ring * self.num_kv_stages * 2, num_stages=self.num_kv_stages,
-            producer_group=prod_group, consumer_group=kv_cons_group, tx_count=self.num_kv_tma_bytes,
-            cta_layout_vmnk=cluster_layout_vmnk, tidx=tidx, defer_sync=True,
-        )
-        umma_cons_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, 128)
-        umma_pipes = [
-            pipeline.PipelineUmmaAsync.create(
-                barrier_storage=storage.umma_mbar.data_ptr() + g * 2, num_stages=1,
+            umma_cons_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, 128)
+            umma_pipes = [
+                pipeline.PipelineUmmaAsync.create(
+                    barrier_storage=storage.umma_mbar.data_ptr() + g * 2, num_stages=1,
+                    producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread), consumer_group=umma_cons_group,
+                    cta_layout_vmnk=cluster_layout_vmnk, defer_sync=True,
+                )
+                for g in range(2)
+            ]
+            umma_pipeline_math = pipeline.PipelineUmmaAsync.create(
+                barrier_storage=storage.umma_mbar.data_ptr() + math_ring * 2, num_stages=1,
                 producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread), consumer_group=umma_cons_group,
                 cta_layout_vmnk=cluster_layout_vmnk, defer_sync=True,
             )
-            for g in range(2)
-        ]
-        umma_pipeline_math = pipeline.PipelineUmmaAsync.create(
-            barrier_storage=storage.umma_mbar.data_ptr() + math_ring * 2, num_stages=1,
-            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread), consumer_group=umma_cons_group,
-            cta_layout_vmnk=cluster_layout_vmnk, defer_sync=True,
-        )
-        tmem = utils.TmemAllocator(
-            storage.tmem_holding_buf, barrier_for_retrieve=pipeline.NamedBarrier(barrier_id=1, num_threads=288),
-            allocator_warp_id=0, is_two_cta=False,
-        )
-        pipeline_init_arrive(cluster_shape_mn=self.cluster_shape_mn, is_relaxed=True)
-
-        sKV = [
-            smem.allocate_tensor(
-                element_type=self.a_dtype, layout=a_smem_layout_staged.outer, byte_alignment=128,
-                swizzle=a_smem_layout_staged.inner,
+            tmem = utils.TmemAllocator(
+                storage.tmem_holding_buf, barrier_for_retrieve=pipeline.NamedBarrier(barrier_id=1, num_threads=288),
+                allocator_warp_id=0, is_two_cta=False,
             )
-            for _ in range(2)
-        ]
-        sQ = smem.allocate_tensor(
-            element_type=self.b_dtype, layout=b_smem_layout_staged.outer, byte_alignment=128,
-            swizzle=b_smem_layout_staged.inner,
-        )
-        sW = smem.allocate_tensor(
-            element_type=Float32,
-            layout=cute.make_layout((BLOCK_Q, COLS, 1), stride=(COLS, 1, BLOCK_Q * COLS)),
-            byte_alignment=128,
-        )
-        # Per group: [key, stage] scales, then key norms.
-        vec_layout = cute.make_layout((BLOCK_KV, self.num_kv_stages, 2, 2), stride=(1, BLOCK_KV, BLOCK_KV * self.num_kv_stages, 2 * BLOCK_KV * self.num_kv_stages))
-        sVec = smem.allocate_tensor(element_type=Float32, layout=vec_layout, byte_alignment=128)
-        sPair = smem.allocate_tensor(
-            element_type=Float32, layout=cute.make_layout((BLOCK_Q // 2, PAIR_FLOATS), stride=(PAIR_FLOATS, 1)),
-            byte_alignment=16,
-        )
-        sWin = smem.allocate_tensor(element_type=Int32, layout=cute.make_layout((BLOCK_Q, 2), stride=(2, 1)), byte_alignment=16)
+            pipeline_init_arrive(cluster_shape_mn=self.cluster_shape_mn, is_relaxed=True)
 
-        thr_mma = tiled_mma.get_slice(0)
-        gA = cute.local_tile(cute.domain_offset((kv_start, 0, 0), mA_mkl), cute.slice_(self.mma_tiler, (None, 0, None)), (None, None, None))
-        tCgA = thr_mma.partition_A(gA)
-        tA = [
-            cpasync.tma_partition(tma_atom_a, 0, cute.make_layout(1), cute.group_modes(sKV[g], 0, 3), cute.group_modes(tCgA, 0, 3))
-            for g in range(2)
-        ]
-        # [group][scales, key norms] -> (smem, gmem) partitions.
-        gVec = [cute.local_tile(cute.domain_offset((kv_start,), m), (BLOCK_KV,), (None,)) for m in (mS, mN)]
-        tVec = [
-            [
-                cpasync.tma_partition(
-                    atom, 0, cute.make_layout(1), cute.group_modes(sVec[(None, None, which, g)], 0, 1), gVec[which]
+            sKV = [
+                smem.allocate_tensor(
+                    element_type=self.a_dtype, layout=a_smem_layout_staged.outer, byte_alignment=128,
+                    swizzle=a_smem_layout_staged.inner,
                 )
-                for which, atom in enumerate((tma_atom_s, tma_atom_n))
+                for _ in range(2)
             ]
-            for g in range(2)
-        ]
-        gB = cute.local_tile(
-            cute.domain_offset((tile * self.N, 0, 0), mB_nkl), cute.slice_(self.mma_tiler, (0, None, None)), (None, None, None)
-        )
-        tBsB, tBgB = cpasync.tma_partition(
-            tma_atom_b, 0, cute.make_layout(1), cute.group_modes(sQ, 0, 3), cute.group_modes(thr_mma.partition_B(gB), 0, 3)
-        )
-        gW = cute.local_tile(cute.domain_offset((query_start, 0), mW), (BLOCK_Q, COLS), (None, None))
-        tWsW, tWgW = cpasync.tma_partition(tma_atom_w, 0, cute.make_layout(1), cute.group_modes(sW, 0, 2), cute.group_modes(gW, 0, 2))
-
-        tCrA = [tiled_mma.make_fragment_A(sKV[g]) for g in range(2)]
-        tCrB = tiled_mma.make_fragment_B(sQ)
-        acc_shape = tiled_mma.partition_shape_C(self.mma_tiler[:2])
-        tCtAcc_fake = tiled_mma.make_fragment_C(cute.append(acc_shape, 1))
-        epi_sub_mn = (epi_tile[0], self.N // NUM_EPI_SUBTILES)
-        copy_atom_t2r = sm100_utils.get_tmem_load_op(
-            self.cta_tile_shape_mnk, utils.LayoutEnum.ROW_MAJOR, self.acc_dtype, self.acc_dtype, (epi_sub_mn[0], 32), False
-        )
-
-        pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
-
-        if (warp_idx == 8) | (warp_idx == 9):
-            cute.arch.setmaxregister_decrease(self.specialized_wg_registers)
-            group = warp_idx - 8
-            kv_prod = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.num_kv_stages)
-            if (group == 0) & has_work:
-                q_prod = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, 1)
-                q_pipeline.producer_acquire(q_prod)
-                q_bar = q_pipeline.producer_get_barrier(q_prod)
-                cute.copy(tma_atom_b, tBgB[(None, 0, 0, 0)], tBsB[(None, 0)], tma_bar_ptr=q_bar)
-                cute.copy(tma_atom_w, tWgW[(None, 0, 0)], tWsW[(None, 0)], tma_bar_ptr=q_bar)
-            for g in cutlass.range_constexpr(2):
-                if group == g:
-                    tAsA, tAgA = tA[g]
-                    for pair in cutlass.range(num_pairs, unroll=1):
-                        kv_pipes[g].producer_acquire(kv_prod)
-                        bar = kv_pipes[g].producer_get_barrier(kv_prod)
-                        stage = kv_prod.index
-                        blk = pair * NUM_MATH_WG + g
-                        cute.copy(tma_atom_a, tAgA[(None, blk, 0, 0)], tAsA[(None, stage)], tma_bar_ptr=bar)
-                        for which, atom in enumerate((tma_atom_s, tma_atom_n)):
-                            tVs, tVg = tVec[g][which]
-                            cute.copy(atom, tVg[(None, blk)], tVs[(None, stage)], tma_bar_ptr=bar)
-                        kv_prod.advance()
-        elif warp_idx == 10:
-            cute.arch.setmaxregister_decrease(self.specialized_wg_registers)
-            named_barrier_sync_unaligned(288)
-            tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
-            acc_0 = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)[(None, None, None, 0)]
-            acc_1 = cute.make_tensor(tmem_ptr + self.num_tmem_alloc_cols, tCtAcc_fake.layout)[(None, None, None, 0)]
-            q_cons = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, 1)
-            # One named state per pipeline: states advanced in place stay loop-carried.
-            kv_cons_0 = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.num_kv_stages)
-            kv_cons_1 = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.num_kv_stages)
-            umma_prod_0 = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, 1)
-            umma_prod_1 = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, 1)
-            num_k = cute.size(tCrA[0].shape[2])
-            if has_work:
-                q_pipeline.consumer_wait(q_cons)
-            for pair in cutlass.range(num_pairs, unroll=1):
-                ready = kv_pipes[0].consumer_try_wait(kv_cons_0)
-                empty = umma_pipes[0].producer_try_acquire(umma_prod_0)
-                kv_pipes[0].consumer_wait(kv_cons_0, ready)
-                umma_pipes[0].producer_acquire(umma_prod_0, empty)
-                tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
-                for k in cutlass.range_constexpr(num_k):
-                    cute.gemm(tiled_mma, acc_0, tCrA[0][None, None, k, kv_cons_0.index], tCrB[None, None, k, 0], acc_0)
-                    tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
-                kv_cons_0.advance()
-                umma_pipes[0].producer_commit(umma_prod_0)
-                umma_prod_0.advance()
-
-                ready = kv_pipes[1].consumer_try_wait(kv_cons_1)
-                empty = umma_pipes[1].producer_try_acquire(umma_prod_1)
-                kv_pipes[1].consumer_wait(kv_cons_1, ready)
-                umma_pipes[1].producer_acquire(umma_prod_1, empty)
-                tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
-                for k in cutlass.range_constexpr(num_k):
-                    cute.gemm(tiled_mma, acc_1, tCrA[1][None, None, k, kv_cons_1.index], tCrB[None, None, k, 0], acc_1)
-                    tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
-                kv_cons_1.advance()
-                umma_pipes[1].producer_commit(umma_prod_1)
-                umma_prod_1.advance()
-        elif warp_idx < 8:
-            self._run_math_warp(
-                has_work, num_pairs, kv_start, num_kv, cover_lo, cover_hi, split_lo, split_hi, query_start, tile,
-                num_q, seq_len_kv, mask_blocks, copy_atom_t2r, epi_sub_mn, kv_pipeline_math, q_pipeline, sVec, sW,
-                sPair, sWin, tCtAcc_fake, tidx, tmem, umma_pipeline_math, warpgroup_idx, mRowStart, mRowEnd, mOrigin,
-                mInvDelta, mThBucket, mAllowance, mMask,
+            sQ = smem.allocate_tensor(
+                element_type=self.b_dtype, layout=b_smem_layout_staged.outer, byte_alignment=128,
+                swizzle=b_smem_layout_staged.inner,
             )
-        else:
-            cute.arch.setmaxregister_decrease(self.specialized_wg_registers)
+            sW = smem.allocate_tensor(
+                element_type=Float32,
+                layout=cute.make_layout((self.block_q, self.cols, 1), stride=(self.cols, 1, self.block_q * self.cols)),
+                byte_alignment=128,
+            )
+            # Per group: [key, stage] scales, then key norms.
+            vec_layout = cute.make_layout((BLOCK_KV, self.num_kv_stages, 2, 2), stride=(1, BLOCK_KV, BLOCK_KV * self.num_kv_stages, 2 * BLOCK_KV * self.num_kv_stages))
+            sVec = smem.allocate_tensor(element_type=Float32, layout=vec_layout, byte_alignment=128)
+            sPair = smem.allocate_tensor(
+                element_type=Float32, layout=cute.make_layout((self.block_q // 2, self.pair_floats), stride=(self.pair_floats, 1)),
+                byte_alignment=16,
+            )
+            sWin = smem.allocate_tensor(element_type=Int32, layout=cute.make_layout((self.block_q, 2), stride=(2, 1)), byte_alignment=16)
+
+            thr_mma = tiled_mma.get_slice(0)
+            gA = cute.local_tile(cute.domain_offset((kv_start, 0, 0), mA_mkl), cute.slice_(self.mma_tiler, (None, 0, None)), (None, None, None))
+            tCgA = thr_mma.partition_A(gA)
+            tA = [
+                cpasync.tma_partition(tma_atom_a, 0, cute.make_layout(1), cute.group_modes(sKV[g], 0, 3), cute.group_modes(tCgA, 0, 3))
+                for g in range(2)
+            ]
+            # [group][scales, key norms] -> (smem, gmem) partitions.
+            gVec = [cute.local_tile(cute.domain_offset((kv_start,), m), (BLOCK_KV,), (None,)) for m in (mS, mN)]
+            tVec = [
+                [
+                    cpasync.tma_partition(
+                        atom, 0, cute.make_layout(1), cute.group_modes(sVec[(None, None, which, g)], 0, 1), gVec[which]
+                    )
+                    for which, atom in enumerate((tma_atom_s, tma_atom_n))
+                ]
+                for g in range(2)
+            ]
+            gB = cute.local_tile(
+                cute.domain_offset((tile * self.N, 0, 0), mB_nkl), cute.slice_(self.mma_tiler, (0, None, None)), (None, None, None)
+            )
+            tBsB, tBgB = cpasync.tma_partition(
+                tma_atom_b, 0, cute.make_layout(1), cute.group_modes(sQ, 0, 3), cute.group_modes(thr_mma.partition_B(gB), 0, 3)
+            )
+            gW = cute.local_tile(cute.domain_offset((query_start, 0), mW), (self.block_q, self.cols), (None, None))
+            tWsW, tWgW = cpasync.tma_partition(tma_atom_w, 0, cute.make_layout(1), cute.group_modes(sW, 0, 2), cute.group_modes(gW, 0, 2))
+
+            tCrA = [tiled_mma.make_fragment_A(sKV[g]) for g in range(2)]
+            tCrB = tiled_mma.make_fragment_B(sQ)
+            acc_shape = tiled_mma.partition_shape_C(self.mma_tiler[:2])
+            tCtAcc_fake = tiled_mma.make_fragment_C(cute.append(acc_shape, 1))
+            epi_sub_mn = (epi_tile[0], self.N // NUM_EPI_SUBTILES)
+            t2r_cols = 32 if epi_sub_mn[1] % 32 == 0 else 16
+            copy_atom_t2r = sm100_utils.get_tmem_load_op(
+                self.cta_tile_shape_mnk, utils.LayoutEnum.ROW_MAJOR, self.acc_dtype, self.acc_dtype,
+                (epi_sub_mn[0], t2r_cols), False,
+            )
+
+            pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
+
+            if (warp_idx == 8) | (warp_idx == 9):
+                cute.arch.setmaxregister_decrease(self.specialized_wg_registers)
+                group = warp_idx - 8
+                kv_prod = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.num_kv_stages)
+                if group == 0:
+                    q_prod = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, 1)
+                    q_pipeline.producer_acquire(q_prod)
+                    q_bar = q_pipeline.producer_get_barrier(q_prod)
+                    cute.copy(tma_atom_b, tBgB[(None, 0, 0, 0)], tBsB[(None, 0)], tma_bar_ptr=q_bar)
+                    cute.copy(tma_atom_w, tWgW[(None, 0, 0)], tWsW[(None, 0)], tma_bar_ptr=q_bar)
+                for g in cutlass.range_constexpr(2):
+                    if group == g:
+                        tAsA, tAgA = tA[g]
+                        for pair in cutlass.range(num_pairs, unroll=1):
+                            kv_pipes[g].producer_acquire(kv_prod)
+                            bar = kv_pipes[g].producer_get_barrier(kv_prod)
+                            stage = kv_prod.index
+                            blk = pair * NUM_MATH_WG + g
+                            cute.copy(tma_atom_a, tAgA[(None, blk, 0, 0)], tAsA[(None, stage)], tma_bar_ptr=bar)
+                            for which, atom in enumerate((tma_atom_s, tma_atom_n)):
+                                tVs, tVg = tVec[g][which]
+                                cute.copy(atom, tVg[(None, blk)], tVs[(None, stage)], tma_bar_ptr=bar)
+                            kv_prod.advance()
+            elif warp_idx == 10:
+                cute.arch.setmaxregister_decrease(self.specialized_wg_registers)
+                named_barrier_sync_unaligned(288)
+                tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
+                acc_0 = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)[(None, None, None, 0)]
+                acc_1 = cute.make_tensor(tmem_ptr + self.num_tmem_alloc_cols, tCtAcc_fake.layout)[(None, None, None, 0)]
+                q_cons = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, 1)
+                kv_cons_0 = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.num_kv_stages)
+                kv_cons_1 = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.num_kv_stages)
+                umma_prod_0 = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, 1)
+                umma_prod_1 = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, 1)
+                num_k = cute.size(tCrA[0].shape[2])
+                q_pipeline.consumer_wait(q_cons)
+                for pair in cutlass.range(num_pairs, unroll=1):
+                    ready = kv_pipes[0].consumer_try_wait(kv_cons_0)
+                    empty = umma_pipes[0].producer_try_acquire(umma_prod_0)
+                    kv_pipes[0].consumer_wait(kv_cons_0, ready)
+                    umma_pipes[0].producer_acquire(umma_prod_0, empty)
+                    tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
+                    for k in cutlass.range_constexpr(num_k):
+                        cute.gemm(tiled_mma, acc_0, tCrA[0][None, None, k, kv_cons_0.index], tCrB[None, None, k, 0], acc_0)
+                        tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+                    kv_cons_0.advance()
+                    umma_pipes[0].producer_commit(umma_prod_0)
+                    umma_prod_0.advance()
+
+                    ready = kv_pipes[1].consumer_try_wait(kv_cons_1)
+                    empty = umma_pipes[1].producer_try_acquire(umma_prod_1)
+                    kv_pipes[1].consumer_wait(kv_cons_1, ready)
+                    umma_pipes[1].producer_acquire(umma_prod_1, empty)
+                    tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
+                    for k in cutlass.range_constexpr(num_k):
+                        cute.gemm(tiled_mma, acc_1, tCrA[1][None, None, k, kv_cons_1.index], tCrB[None, None, k, 0], acc_1)
+                        tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+                    kv_cons_1.advance()
+                    umma_pipes[1].producer_commit(umma_prod_1)
+                    umma_prod_1.advance()
+            elif warp_idx < 8:
+                self._run_math_warp(
+                    has_work, num_pairs, kv_start, num_kv, cover_lo, cover_hi, split_lo, split_hi, query_start, tile,
+                    num_q, seq_len_kv, mask_blocks, copy_atom_t2r, epi_sub_mn, kv_pipeline_math, q_pipeline, sVec, sW,
+                    sPair, sWin, tCtAcc_fake, tidx, tmem, umma_pipeline_math, warpgroup_idx, mRowStart, mRowEnd, mOrigin,
+                    mInvDelta, mThBucket, mAllowance, mMask,
+                )
+            else:
+                cute.arch.setmaxregister_decrease(self.specialized_wg_registers)
 
     @cute.jit
     def _run_math_warp(
@@ -447,31 +461,31 @@ class PruneSm100:
             q_pipeline.consumer_wait(q_cons)
             # The pair layout: retained heads' weights halved (the sum takes x + |x|), the aggregate's scales as
             # they are, then the rows' allowances and raw gates; and the rows' windows.
-            if tidx < BLOCK_Q * COLS:
-                r = tidx // COLS
-                c = tidx % COLS
+            if tidx < self.block_q * self.cols:
+                r = tidx // self.cols
+                c = tidx % self.cols
                 w = sW[(r, c, 0)]
-                if c < COLS - 2:
+                if c < self.cols - 2:
                     w = w * Float32(0.5)
                 sPair[(r // 2, 2 * c + r % 2)] = w
-            if tidx < BLOCK_Q:
+            if tidx < self.block_q:
                 row_q = query_start + tidx
                 row = min(row_q, num_q - 1)
-                sPair[(tidx // 2, 2 * COLS + tidx % 2)] = mAllowance[row]
-                sPair[(tidx // 2, 2 * COLS + 2 + tidx % 2)] = loose_raw_gate(mInvDelta[row], mOrigin[row], mThBucket[row])
+                sPair[(tidx // 2, 2 * self.cols + tidx % 2)] = mAllowance[row]
+                sPair[(tidx // 2, 2 * self.cols + 2 + tidx % 2)] = loose_raw_gate(mInvDelta[row], mOrigin[row], mThBucket[row])
                 s = seq_len_kv
                 e = Int32(0)
                 if row_q < num_q:
                     s = max(min(mRowStart[row_q], seq_len_kv), split_lo)
                     e = min(min(mRowEnd[row_q], seq_len_kv), split_hi)
                 sWin[(tidx, 0)] = s
-                sWin[(tidx, 1)] = max(e - s, Int32(0))
+                sWin[(tidx, 1)] = e
             cute.arch.sync_warp()
             pipeline.NamedBarrier(barrier_id=2, num_threads=self.num_math_threads).arrive_and_wait()
 
         kv_cons = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.num_kv_stages)
         umma_cons = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, 1)
-        tile_base = (2 * tile * mask_blocks) * 4 + quad
+        tile_base = (self.halves * tile * mask_blocks) * 4 + quad
         for pair in cutlass.range(num_pairs, unroll=1):
             j = pair * NUM_MATH_WG + warpgroup_idx
             umma_pipeline_math.consumer_wait(umma_cons)
@@ -484,7 +498,7 @@ class PruneSm100:
             blk_lo = kv_start + j * BLOCK_KV
             kv_idx = blk_lo + m_coord
             interior = (blk_lo >= cover_lo) & (blk_lo + BLOCK_KV <= cover_hi)
-            surv = [cutlass.Boolean(False), cutlass.Boolean(False)]
+            surv = [cutlass.Boolean(False) for _ in range(self.halves)]
             for e in cutlass.range_constexpr(NUM_EPI_SUBTILES):
                 if e > 0:
                     cute.arch.fence_view_async_tmem_load()
@@ -494,22 +508,21 @@ class PruneSm100:
                 acc = tTR_rAcc.load()
                 if e + 1 < NUM_EPI_SUBTILES:
                     cute.copy(tiled_copy_t2r, tTR_tAcc[(None, None, None, 0, e + 1)], tTR_rAcc)
-                for pp in cutlass.range_constexpr(2):
-                    p = 2 * e + pp
-                    keep = self._pair_bound(acc, pp * 2 * COLS, p, sPair, scale, norm)
+                for pp in cutlass.range_constexpr(self.pairs_per_subtile):
+                    p = self.pairs_per_subtile * e + pp
+                    keep = self._pair_bound(acc, pp * 2 * self.cols, p, sPair, scale, norm)
                     for half_row in cutlass.range_constexpr(2):
                         r = 2 * p + half_row
-                        in_win = interior | (cutlass.Uint32(kv_idx - sWin[(r, 0)]) < cutlass.Uint32(sWin[(r, 1)]))
+                        in_win = interior | ((kv_idx >= sWin[(r, 0)]) & (kv_idx < sWin[(r, 1)]))
                         surv[p // 4] = surv[p // 4] | (keep[half_row] & in_win)
             kv_pipeline_math.consumer_release(kv_cons)
             kv_cons.advance()
-            m_lo = cute.arch.vote_ballot_sync(surv[0])
-            m_hi = cute.arch.vote_ballot_sync(surv[1])
+            words = [cute.arch.vote_ballot_sync(surv[h]) for h in range(self.halves)]
             if (lane == 0) & (j < num_kv):
                 gblock = kv_start // BLOCK_KV + j
                 base = mMask.iterator.toint() + cutlass.Int64(tile_base + gblock * 4) * 4
-                store_global_b32(base, m_lo)
-                store_global_b32(base + cutlass.Int64(mask_blocks * 4) * 4, m_hi)
+                for h in cutlass.range_constexpr(self.halves):
+                    store_global_b32(base + cutlass.Int64(h * mask_blocks * 4) * 4, words[h])
             cute.arch.sync_warp()
 
         if has_work:
@@ -520,6 +533,7 @@ class PruneSm100:
     @cute.jit
     def _pair_bound(self, acc, c0, p, sPair, scale, norm):
         """Whether each row of pair p keeps the key: bound > gate (NaN keeps)."""
+        cols = self.cols
 
         def x(c):
             return (acc[c0 + 2 * c], acc[c0 + 2 * c + 1])
@@ -532,12 +546,12 @@ class PruneSm100:
 
         acc0 = (Float32(0.0), Float32(0.0))
         acc1 = (Float32(0.0), Float32(0.0))
-        for c in cutlass.range_constexpr(0, COLS - 2, 2):
+        for c in cutlass.range_constexpr(0, cols - 2, 2):
             acc0 = cute.arch.fma_packed_f32x2(pos2(x(c)), (w(2 * c), w(2 * c + 1)), acc0, rnd=_RND_RN)
             acc1 = cute.arch.fma_packed_f32x2(pos2(x(c + 1)), (w(2 * c + 2), w(2 * c + 3)), acc1, rnd=_RND_RN)
-        k = 2 * (COLS - 2)
+        k = 2 * (cols - 2)
         agg = cute.arch.fma_packed_f32x2(
-            x(COLS - 1), (w(k + 2), w(k + 3)), cute.arch.mul_packed_f32x2(x(COLS - 2), (w(k), w(k + 1)), rnd=_RND_RN),
+            x(cols - 1), (w(k + 2), w(k + 3)), cute.arch.mul_packed_f32x2(x(cols - 2), (w(k), w(k + 1)), rnd=_RND_RN),
             rnd=_RND_RN,
         )
         reduced = cute.arch.add_packed_f32x2(
@@ -545,7 +559,7 @@ class PruneSm100:
             (-fmax(agg[0], Float32(0.0)), -fmax(agg[1], Float32(0.0))),
             rnd=_RND_RN,
         )
-        a = 2 * COLS
+        a = 2 * cols
         bound = cute.arch.fma_packed_f32x2(
             (w(a), w(a + 1)), (norm, norm), cute.arch.mul_packed_f32x2((scale, scale), reduced, rnd=_RND_RN), rnd=_RND_RN
         )

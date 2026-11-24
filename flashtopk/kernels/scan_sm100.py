@@ -60,7 +60,15 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
-from .common import abs_f32, atomic_add_global_i32, fp32_to_i32_bits, loose_raw_gate, select_i32, store_global_b32
+from .common import (
+    abs_f32,
+    atomic_add_global_i32,
+    fp32_to_i32_bits,
+    loose_raw_gate,
+    select_i32,
+    store_global_b32,
+    store_global_v4_b32,
+)
 
 _RND_RN = "rn"
 
@@ -159,6 +167,8 @@ class ScanSm100:
         self.num_heads = NUM_HEADS
         self.head_dim = HEAD_DIM
         self.N = NEXT_N * NUM_HEADS
+        # single_split holds 16 weights/row in registers; split/dense uses 12 to keep 0 local spills.
+        self.num_w_in_reg = NUM_W_IN_REG if self.single_split else 12
         # A BF16 KV stage is twice an FP8 one: two stages per ring keep shared memory under 227 KB.
         self.num_kv_stages = 2 if bf16 else NUM_KV_STAGES
         self.num_umma_stages = 1
@@ -219,6 +229,8 @@ class ScanSm100:
         num_q: Int32,
         seq_len_kv: Int32,
         num_splits: Int32,
+        full_tiles: Int32,
+        tail_chunks: Int32,
         stream: cuda.CUstream,
     ):
         if cutlass.const_expr(self.bf16):
@@ -266,6 +278,8 @@ class ScanSm100:
             tmem_holding_buf: Int32
 
         num_tiles = (num_q + self.next_n - 1) // self.next_n
+        full_tiles = min(full_tiles, num_tiles)
+        grid_x = full_tiles + (num_tiles - full_tiles) * tail_chunks
         self.kernel(
             tiled_mma,
             tma_atom_a,
@@ -287,6 +301,8 @@ class ScanSm100:
             num_q,
             seq_len_kv,
             num_splits,
+            full_tiles,
+            tail_chunks,
             self.cluster_layout_vmnk,
             self.a_smem_layout_staged,
             self.b_smem_layout_staged,
@@ -294,7 +310,7 @@ class ScanSm100:
             self.epi_tile,
             SharedStorage,
         ).launch(
-            grid=(num_tiles, num_splits, 1),
+            grid=(grid_x, num_splits, 1),
             block=[self.threads_per_cta, 1, 1],
             cluster=(*self.cluster_shape_mn, 1),
             min_blocks_per_mp=1,
@@ -324,6 +340,8 @@ class ScanSm100:
         num_q: Int32,
         seq_len_kv: Int32,
         num_splits: Int32,
+        full_tiles: Int32,
+        tail_chunks: Int32,
         cluster_layout_vmnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
         b_smem_layout_staged: cute.ComposedLayout,
@@ -334,7 +352,6 @@ class ScanSm100:
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         tidx, _, _ = cute.arch.thread_idx()
         bidx, bidy, _ = cute.arch.block_idx()
-        gdimx, _, _ = cute.arch.grid_dim()
         block_kv = self.block_kv
         next_n = self.next_n
         num_heads = self.num_heads
@@ -346,17 +363,46 @@ class ScanSm100:
         is_umma_warp = warp_idx == 10
         is_store_warp = warp_idx >= 12
 
-        # Longest windows first: under causal masking the last tile's rows see the most keys.
-        tile = gdimx - 1 - bidx
-        split = bidy
-        query_start = tile * next_n
+        # Longest windows first; partial-wave tail tiles (bidx >= full_tiles) split across KV in chunk-major order
+        # so concurrent CTAs in the tail wave share L2 while full waves stay single-split (register cursor).
+        num_tiles = (num_q + next_n - 1) // next_n
+        if cutlass.const_expr(self.single_split):
+            tile = num_tiles - 1 - bidx
+            tile_splits = Int32(1)
+            split_lo = Int32(0)
+            split_hi = seq_len_kv
+            query_start = tile * next_n
+        else:
+            tail_tiles = max(num_tiles - full_tiles, Int32(1))
+            is_tail = bidx >= full_tiles
+            rem = bidx - full_tiles
+            tile = select_i32(is_tail, tail_tiles - 1 - (rem % tail_tiles), num_tiles - 1 - bidx)
+            split = select_i32(is_tail, rem // tail_tiles, bidy)
+            tile_splits = select_i32(is_tail, tail_chunks, num_splits)
+            query_start = tile * next_n
 
-        # This CTA's KV range: the union of its rows' windows clipped to the split, and the
-        # range every row covers (blocks inside it need no per-key window check).
-        total_blocks = (seq_len_kv + block_kv - 1) // block_kv
-        blocks_per_split = (total_blocks + num_splits - 1) // num_splits
-        split_lo = split * blocks_per_split * block_kv
-        split_hi = min((split + 1) * blocks_per_split * block_kv, seq_len_kv)
+            union_lo = seq_len_kv
+            union_hi = Int32(0)
+            for r in cutlass.range_constexpr(next_n):
+                row = query_start + r
+                s = seq_len_kv
+                e = Int32(0)
+                if row < num_q:
+                    s = min(max(mRowStart[row], Int32(0)), seq_len_kv)
+                    e = min(max(mRowEnd[row], Int32(0)), seq_len_kv)
+                nonempty = e > s
+                union_lo = min(union_lo, select_i32(nonempty, s, seq_len_kv))
+                union_hi = max(union_hi, select_i32(nonempty, e, 0))
+
+            split_lo = Int32(0)
+            split_hi = seq_len_kv
+            if (union_hi > union_lo) & (tile_splits > 1):
+                u_lo_blk = union_lo // block_kv
+                u_hi_blk = (union_hi + block_kv - 1) // block_kv
+                blocks_per_split = (u_hi_blk - u_lo_blk + tile_splits - 1) // tile_splits
+                split_lo = (u_lo_blk + split * blocks_per_split) * block_kv
+                split_hi = min((u_lo_blk + (split + 1) * blocks_per_split) * block_kv, seq_len_kv)
+
         range_lo = seq_len_kv
         range_hi = Int32(0)
         cover_lo = Int32(0)
@@ -691,6 +737,7 @@ class ScanSm100:
                 query_start,
                 num_q,
                 seq_len_kv,
+                tile_splits,
                 mRowStart,
                 mRowEnd,
                 mOrigin,
@@ -755,7 +802,7 @@ class ScanSm100:
         tTR_rAcc = cute.make_rmem_tensor_like(tTR_cC, self.acc_dtype)
         m_coord = tTR_cC[0][0]
 
-        w_cache = cute.make_rmem_tensor(cute.make_layout((next_n, NUM_W_IN_REG), stride=(NUM_W_IN_REG, 1)), Float32)
+        w_cache = cute.make_rmem_tensor(cute.make_layout((next_n, self.num_w_in_reg), stride=(self.num_w_in_reg, 1)), Float32)
         if has_work:
             q_pipeline.consumer_wait(q_cons_state)
             # A warp-private replica of the tile's weights (lane = head). Heads on the
@@ -769,7 +816,7 @@ class ScanSm100:
                 sWarpWeights[(weight_warp, weight_row, weight_lane)] = sW[(weight_row, weight_lane, 0)] * weight_factor
             cute.arch.sync_warp()
             for t_i in cutlass.range_constexpr(next_n):
-                for w_j in cutlass.range_constexpr(NUM_W_IN_REG):
+                for w_j in cutlass.range_constexpr(self.num_w_in_reg):
                     w_cache[(t_i, w_j)] = sWarpWeights[(weight_warp, t_i, w_j)]
 
         num_epi_subtiles = self.num_epi_subtiles
@@ -839,7 +886,7 @@ class ScanSm100:
                     a1 = i32_bits_to_fp32(cutlass.max(fp32_to_i32_bits(acc_vec[n0 + 1]), Int32(0)))
                     a2 = i32_bits_to_fp32(cutlass.max(fp32_to_i32_bits(acc_vec[n0 + 2]), Int32(0)))
                     a3 = i32_bits_to_fp32(cutlass.max(fp32_to_i32_bits(acc_vec[n0 + 3]), Int32(0)))
-                if cutlass.const_expr(h < NUM_W_IN_REG):
+                if cutlass.const_expr(h < self.num_w_in_reg):
                     w0, w1, w2, w3 = w_cache[(t, h)], w_cache[(t, h + 1)], w_cache[(t, h + 2)], w_cache[(t, h + 3)]
                 else:
                     w0 = sWarpWeights[(weight_warp, t, h)]
@@ -870,6 +917,7 @@ class ScanSm100:
         query_start,
         num_q,
         seq_len_kv,
+        tile_splits,
         mRowStart,
         mRowEnd,
         mOrigin,
@@ -899,6 +947,7 @@ class ScanSm100:
         cnt_addr = make_warp_uniform_i64(mCandCnt.iterator.toint())
         val_stride = make_warp_uniform_i64(mCandVal.layout.stride[0])
         idx_stride = make_warp_uniform_i64(mCandIdx.layout.stride[0])
+        use_cursor = cutlass.Boolean(tile_splits == Int32(1))
 
         # Per owned row: validity, raw gate, window [start, start + len), output rows, cursor.
         row_valid = [cutlass.Boolean(False) for _ in range(num_q_groups)]
@@ -943,15 +992,27 @@ class ScanSm100:
             store_cons_state_1.advance()
 
             if cutlass.const_expr(self.dense):
-                # Every in-window score at its key; the window check is per row, never the CTA's cover,
-                # which leaves rows with empty windows out.
+                # Coalesced 16-byte stores for full aligned 4-key tuples; boundary/unaligned fall back to scalar.
                 for g in cutlass.range_constexpr(num_q_groups):
-                    for v in cutlass.range_constexpr(4):
-                        for scores, key in ((group_scores_0[g], key_base_0 + v), (group_scores_1[g], key_base_1 + v)):
-                            inside = row_valid[g] & (cutlass.Uint32(key - win_start[g]) < cutlass.Uint32(win_len[g]))
-                            store_global_b32_if(
-                                inside, val_rows[g] + cutlass.Int64(key) * cutlass.Int64(4), fp32_to_i32_bits(scores[v])
+                    win_end_g = win_start[g] + win_len[g]
+                    aligned16 = (val_rows[g] & cutlass.Int64(15)) == cutlass.Int64(0)
+                    for scores, key_base in ((group_scores_0[g], key_base_0), (group_scores_1[g], key_base_1)):
+                        if row_valid[g] & aligned16 & (key_base >= win_start[g]) & (key_base + Int32(4) <= win_end_g):
+                            store_global_v4_b32(
+                                val_rows[g] + cutlass.Int64(key_base) * cutlass.Int64(4),
+                                fp32_to_i32_bits(scores[0]),
+                                fp32_to_i32_bits(scores[1]),
+                                fp32_to_i32_bits(scores[2]),
+                                fp32_to_i32_bits(scores[3]),
                             )
+                        elif row_valid[g] & (key_base < win_end_g) & (key_base + Int32(4) > win_start[g]):
+                            for v in cutlass.range_constexpr(4):
+                                key = key_base + v
+                                inside = (key >= win_start[g]) & (key < win_end_g)
+                                store_global_b32_if(
+                                    inside, val_rows[g] + cutlass.Int64(key) * cutlass.Int64(4),
+                                    fp32_to_i32_bits(scores[v]),
+                                )
             else:
                 for g in cutlass.range_constexpr(num_q_groups):
                     scores_0 = group_scores_0[g]
@@ -971,8 +1032,12 @@ class ScanSm100:
                         masks.append((mask_0, mask_1))
                         total = total + Int32(cute.arch.popc(mask_0)) + Int32(cute.arch.popc(mask_1))
                     if total > 0:
-                        base = cursors[g]
+                        base = Int32(0)
                         if cutlass.const_expr(self.single_split):
+                            base = cursors[g]
+                            cursors[g] = base + total
+                        elif use_cursor:
+                            base = cursors[g]
                             cursors[g] = base + total
                         else:
                             reserved = Int32(0)
@@ -998,8 +1063,14 @@ class ScanSm100:
                             store_global_b32_if(ok_1, val_rows[g] + off_1, fp32_to_i32_bits(-scores_1[v]))
                             store_global_b32_if(ok_1, idx_rows[g] + off_1, key_base_1 + v)
 
-        if cutlass.const_expr(self.single_split):
-            for g in cutlass.range_constexpr(num_q_groups):
-                if row_valid[g] & (lane == 0):
-                    row = query_start + store_warp + g * NUM_STORE_WARPS
-                    store_global_b32(cnt_addr + cutlass.Int64(row) * cutlass.Int64(4), cursors[g])
+        if cutlass.const_expr(not self.dense):
+            if cutlass.const_expr(self.single_split):
+                for g in cutlass.range_constexpr(num_q_groups):
+                    if row_valid[g] & (lane == 0):
+                        row = query_start + store_warp + g * NUM_STORE_WARPS
+                        store_global_b32(cnt_addr + cutlass.Int64(row) * cutlass.Int64(4), cursors[g])
+            elif use_cursor:
+                for g in cutlass.range_constexpr(num_q_groups):
+                    if row_valid[g] & (lane == 0):
+                        row = query_start + store_warp + g * NUM_STORE_WARPS
+                        store_global_b32(cnt_addr + cutlass.Int64(row) * cutlass.Int64(4), cursors[g])

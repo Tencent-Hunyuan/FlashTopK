@@ -15,8 +15,8 @@ pytestmark = requires_gpu
 
 @pytest.mark.parametrize("pruning", ["off", "always", "adaptive"])
 def test_no_synchronization(pruning):
-    q, kv, s, w, ks, ke = make_call(300, 140000, torch.float8_e4m3fn, seed=41)
-    sel = flashtopk.Selector(TOPK, dtype=torch.float8_e4m3fn, pruning=pruning).plan(300, 140000, warmup=False)
+    q, kv, s, w, ks, ke = make_call(520, 140000, torch.float8_e4m3fn, seed=41)
+    sel = flashtopk.Selector(TOPK, dtype=torch.float8_e4m3fn, pruning=pruning).plan(520, 140000, warmup=False)
     sel.run(q, kv, w, ks, ke, s)
     torch.cuda.synchronize()
     torch.cuda.set_sync_debug_mode("error")

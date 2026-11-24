@@ -2,17 +2,18 @@
 # Copyright (c) 2026 the FlashTopK authors. Licensed under the Apache License, Version 2.0.
 """Time flashtopk on indexer calls and record a digest of each selection.
 
-usage: bench.py --out FILE.jsonl [--pruning adaptive] [--chunk-size ROWS] [--scores] [--warmup 3] [--iters 10]
-                [--shard I/N] [--cuda-graph] JOB ...
+usage: bench.py --out FILE.jsonl [--topk 2048] [--pruning adaptive] [--chunk-size ROWS] [--scores]
+                [--warmup 3] [--iters 10] [--shard I/N] [--cuda-graph] JOB ...
 
 A JOB is one of
   synthetic:DTYPE:KEYS:ROWS[:SEED]  a generated call, e.g. synthetic:fp8:128K:4096: Gaussian q and kv, signed head
                                     weights, causal windows (the ROWS query rows are the last of the KEYS keys);
                                     random operands, on which adaptive pruning mostly scans
-  OPS.pt                            a saved call: FP8 operands (q_fp8 [rows, 32, 128], kv_fp8 [nk, 128], kv_scales
-                                    [nk], w_eff [rows, 32], starts, ends) or BF16 ones (q, kv, weights, starts, ends)
-  @LIST                             jobs from a file, one a line: a job, or a path and a row count (the call's last
-                                    rows, as a prefill chunk)
+  OPS.pt[:KEYS[:ROWS[:OFFSET]]]     a saved call: FP8 operands (q_fp8 [rows, 32, 128], kv_fp8 [nk, 128], kv_scales
+                                    [nk], w_eff [rows, 32], starts, ends) or BF16 ones (q, kv, weights, starts, ends);
+                                    optional slice takes the first KEYS keys and ROWS rows from OFFSET (or ending at
+                                    min(total_rows, KEYS))
+  @LIST                             jobs from a file, one a line (# comments skipped): a job, or a path and row count
 A call is timed with CUDA events around one selection (median of --iters after --warmup), as the GPU sees it back to
 back; --chunk-size sets the selector's chunk_size (default flashtopk's DEFAULT_CHUNK_SIZE), and --scores returns the
 scores with the indices (return_scores=True). With --cuda-graph the selection is also captured in a CUDA graph and
@@ -39,7 +40,22 @@ TOPK = 2048
 SLICE = 65536  # rows generated or hashed at once
 
 
-def load(path, rows=None):
+def count(text):
+    scale = {"K": 1 << 10, "M": 1 << 20}.get(text[-1:].upper(), 1)
+    return int(text[:-1] if scale > 1 else text) * scale
+
+
+def load(spec, rows=None):
+    keys = offset = None
+    if ".pt:" in spec:
+        path, tail = spec.split(".pt:", 1)
+        path += ".pt"
+        parts = [count(x) if x else None for x in tail.split(":")]
+        keys = parts[0] if len(parts) > 0 else None
+        rows = parts[1] if len(parts) > 1 else rows
+        offset = parts[2] if len(parts) > 2 else None
+    else:
+        path = spec
     d = torch.load(path, map_location="cpu", weights_only=False)
     if "q_fp8" in d:
         ops = dict(q=d["q_fp8"], kv=d["kv_fp8"], kv_scales=d["kv_scales"].reshape(-1).float(),
@@ -47,14 +63,25 @@ def load(path, rows=None):
     else:
         ops = dict(q=d["q"], kv=d["kv"], kv_scales=None, weights=d["weights"].float())
     ops.update(ks=d["starts"].int(), ke=d["ends"].int())
-    if rows is not None:
-        ops.update({k: ops[k][-rows:] for k in ("q", "weights", "ks", "ke")})
+    total_nk, total_rows = ops["kv"].shape[0], ops["q"].shape[0]
+    nk = min(total_nk, keys) if keys is not None else total_nk
+    if nk < total_nk:
+        ops["kv"] = ops["kv"][:nk]
+        if ops["kv_scales"] is not None:
+            ops["kv_scales"] = ops["kv_scales"][:nk]
+    if offset is not None:
+        r0 = min(offset, total_rows)
+        r1 = min(total_rows, r0 + (rows if rows is not None else total_rows - r0))
+    elif keys is not None or rows is not None:
+        r1 = min(total_rows, nk) if keys is not None else total_rows
+        r0 = max(0, r1 - rows) if rows is not None else 0
+    else:
+        r0, r1 = 0, total_rows
+    if r0 != 0 or r1 != total_rows:
+        ops.update({k: ops[k][r0:r1] for k in ("q", "weights", "ks", "ke")})
+    if nk < total_nk:
+        ops["ks"], ops["ke"] = ops["ks"].clamp(0, nk), ops["ke"].clamp(0, nk)
     return {k: (None if v is None else v.contiguous().cuda()) for k, v in ops.items()}
-
-
-def count(text):
-    scale = {"K": 1 << 10, "M": 1 << 20}.get(text[-1:].upper(), 1)
-    return int(text[:-1] if scale > 1 else text) * scale
 
 
 def synthetic(spec):
@@ -117,6 +144,7 @@ def graph_times(sel, call, out, warmup, iters):
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--out", required=True)
+    parser.add_argument("--topk", type=int, default=TOPK)
     parser.add_argument("--pruning", default="adaptive", choices=("off", "always", "adaptive"))
     parser.add_argument("--chunk-size", type=int, default=None)
     parser.add_argument("--scores", action="store_true")
@@ -128,15 +156,18 @@ def main():
     args = parser.parse_args()
     jobs = []
     for p in args.ops:
-        lines = [line.split() for line in open(p[1:]) if line.strip()] if p.startswith("@") else [[p]]
-        jobs += [(f[0], int(f[1]) if len(f) > 1 else None) for f in lines]
+        if p.startswith("@"):
+            lines = [line.split() for line in open(p[1:]) if line.strip() and not line.lstrip().startswith("#")]
+        else:
+            lines = [[p]]
+        jobs += [(f[0], count(f[1]) if len(f) > 1 else None) for f in lines]
     shard, nshards = (int(x) for x in args.shard.split("/"))
     jobs = sorted(set(jobs), key=lambda j: (j[0], j[1] or 0))[shard::nshards]
     chunk_size = args.chunk_size or flashtopk.DEFAULT_CHUNK_SIZE
     return_scores = args.scores
     done = set()
     if os.path.exists(args.out):
-        done = {(r["ops"], r["rows"], r.get("chunk_size"), r.get("scores", True))
+        done = {(r["ops"], r["rows"], r.get("nk"), r.get("topk", TOPK), r.get("chunk_size"), r.get("scores", True))
                 for r in map(json.loads, open(args.out))}
     env = dict(device=torch.cuda.get_device_name(), gpu=os.environ.get("CUDA_VISIBLE_DEVICES", ""),
                torch=torch.__version__, flashtopk=flashtopk.__version__)
@@ -145,16 +176,17 @@ def main():
         for path, chunk in jobs:
             ops = synthetic(path) if path.startswith("synthetic:") else load(path, chunk)
             rows, nk = ops["q"].shape[0], ops["kv"].shape[0]
-            if (path, rows, chunk_size, return_scores) in done:
+            if (path, rows, nk, args.topk, chunk_size, return_scores) in done:
                 continue
-            record = dict(ops=path, rows=rows, nk=nk, dtype="bf16" if ops["kv_scales"] is None else "fp8",
+            record = dict(ops=path, rows=rows, nk=nk, topk=args.topk,
+                          dtype="bf16" if ops["kv_scales"] is None else "fp8",
                           pruning=args.pruning, chunk_size=chunk_size, scores=return_scores, **env)
             try:
                 started = time.time()
                 key = ops["q"].dtype
                 if key not in selectors:
-                    selectors[key] = flashtopk.Selector(TOPK, dtype=key, pruning=args.pruning, chunk_size=chunk_size,
-                                                        return_scores=return_scores)
+                    selectors[key] = flashtopk.Selector(args.topk, dtype=key, pruning=args.pruning,
+                                                        chunk_size=chunk_size, return_scores=return_scores)
                 sel = selectors[key].plan(rows, nk, warmup=False)
                 call = (ops["q"], ops["kv"], ops["weights"], ops["ks"], ops["ke"], ops["kv_scales"])
                 times = cuda_times(lambda: sel.run(*call), args.warmup, args.iters)
@@ -164,8 +196,8 @@ def main():
                 torch.cuda.synchronize()
                 info = sel.last_info
                 health = info.health.tolist()
-                record.update(digest=digest(scores, indices), pruned=info.pruned, overflow_rows=health[0],
-                              underfill_rows=health[1], bad_rows=health[7])
+                record.update(digest=digest(scores, indices), pruned=info.pruned, prune_cols=info.prune_cols,
+                              overflow_rows=health[0], underfill_rows=health[1], bad_rows=health[7])
                 if args.cuda_graph:
                     graphed = (torch.empty_like(scores), torch.empty_like(indices)) if return_scores else \
                         torch.empty_like(indices)

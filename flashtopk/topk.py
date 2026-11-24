@@ -30,6 +30,7 @@ import torch
 
 from . import plan as planner
 from .kernels import launch
+from .kernels.common import HEAD_DIM, PRUNE_COLS_24
 from .kernels.selection import H_CAND_MAX, HEALTH_WORDS, RECOVERY_ROWS
 from .recovery import Recovery
 
@@ -37,6 +38,8 @@ NUM_BUCKETS = 256
 SAMPLE_LEN = 8192
 SHARED_MIN_SAMPLES = 2048
 KEYS_PER_SAMPLE = 128
+# Below this key count, scoring densely into the existing arena avoids running the scan twice (sample + full window).
+DENSE_DIRECT_MAX_KEYS = 8192
 # A sampled row's gate starts at about GATE_SLACK * topk candidates (recovery covers a miss), and no tighter than
 # the K_MIN-th best sample.
 GATE_SLACK = 2.0
@@ -122,7 +125,13 @@ class Info:
     @property
     def pruned(self) -> bool:
         """Whether the call pruned keys rather than scanning every key."""
-        return bool(self._pruned) if isinstance(self._pruned, bool) else bool(self._pruned[0])
+        return bool(self._pruned) if isinstance(self._pruned, (bool, int)) else bool(self._pruned[0])
+
+    @property
+    def prune_cols(self) -> int:
+        """Pruning width taken by the call: 0 (full scan), 16, or 24."""
+        code = int(self._pruned) if isinstance(self._pruned, (bool, int)) else int(self._pruned[0])
+        return PRUNE_COLS_24 if code == 2 else (16 if code else 0)
 
     @property
     def estimate(self) -> Optional[float]:
@@ -145,11 +154,11 @@ class Selector:
     then holds no memory past the plan and its outputs (`out` reuses the caller's; a few small per-call buffers go
     through PyTorch's caching allocator) and never synchronizes, so it can be captured in a CUDA graph for one shape.
 
-    pruning: "adaptive" (the GPU chooses per call, from 128K keys), "always" or "off" (default FLASHTOPK_PRUNING, else
-    "adaptive"). The rows the sampled gate misses are always rescored (recovery). chunk_size: the rows worked on at
-    once (default DEFAULT_CHUNK_SIZE); a call with more rows runs in slices of this many, with the same bits.
-    return_scores: True to return the scores with the indices. By default a call returns the indices alone, and the
-    scores go to a buffer of one slice's rows in the workspace rather than to an output of every row.
+    pruning: "adaptive" (the GPU chooses per call, from 128K keys and 512 rows), "always" or "off" (default
+    FLASHTOPK_PRUNING, else "adaptive"). The rows the sampled gate misses are always rescored (recovery). chunk_size:
+    the rows worked on at once (default DEFAULT_CHUNK_SIZE); a call with more rows runs in slices of this many, with
+    the same bits. return_scores: True to return the scores with the indices. By default a call returns the indices
+    alone, and the scores go to a buffer of one slice's rows in the workspace rather than to an output of every row.
     """
 
     def __init__(self, topk: int = 2048, num_heads: int = 32, dtype: torch.dtype = torch.float8_e4m3fn,
@@ -204,12 +213,17 @@ class Selector:
         self._hi = torch.empty(max_rows, **i32)
         self._scan_ks = torch.empty(max_rows, **i32)
         self._prune_ks = torch.empty(max_rows, **i32)
+        self._prune24_ks = torch.empty(max_rows, **i32)
         self._flag = torch.zeros(1, **i32)
         self._estimate = torch.zeros(1, dtype=torch.float32, device=dev)
         self._health = torch.zeros(HEALTH_WORDS, dtype=torch.int64, device=dev)
         self._call_health = torch.zeros(HEALTH_WORDS, dtype=torch.int64, device=dev)
         self._call_pruned = torch.zeros(1, **i32)
         self._bad_rows = torch.zeros(RECOVERY_ROWS, **i32)
+        self._row_ids = torch.arange(max_rows, **i32)
+        sample_dtype = torch.bfloat16 if self.dtype == torch.bfloat16 else torch.uint8
+        self._sample_kv = torch.empty((SAMPLE_LEN, HEAD_DIM), dtype=sample_dtype, device=dev)
+        self._sample_scales = torch.empty((SAMPLE_LEN,), dtype=torch.float32, device=dev)
         self._scores = None if self.return_scores else torch.empty(max_rows, self.topk, dtype=torch.float32, device=dev)
         self._recovery = Recovery(max_rows, max_kv, self.topk, self.dtype, self._arena)
         self.max_rows, self.max_kv = max_rows, max_kv
@@ -296,12 +310,27 @@ class Selector:
         num_samples = sample_count(seq_len_kv)
         width = math.ceil(num_samples / 4) * 4
         arena = self._arena
+        health, bad_rows = self._health, self._bad_rows
+        cand_cnt = self._cand_cnt[:num_q]
+        mode = self.pruning
+        if mode == "adaptive" and not planner.adaptive_eligible(q, seq_len_kv):
+            mode = "off"
+        # Short-KV direct dense path: avoid scoring a short KV window twice (sample + scan).
+        if (mode == "off" and seq_len_kv <= min(DENSE_DIRECT_MAX_KEYS, 16 * topk)
+                and seq_len_kv <= 2 * cap and num_q * seq_len_kv <= arena.numel()):
+            dense = arena[: num_q * seq_len_kv].view(num_q, seq_len_kv)
+            scope = launch.sm90_q_scope(q)
+            with torch.cuda.device(q.device), scope:
+                health.zero_()
+                launch.scan_dense(q, kv, kv_scales, weights, ks, ke, dense, cand_cnt)
+                launch.select_dense(dense, ks, ke, self._row_ids[:num_q], scores, indices)
+            return health, False, None
+
         sample = arena[: num_q * width].view(num_q, width)
         cand_val = arena[: num_q * cap].view(num_q, cap)
         cand_idx = arena[num_q * cap: 2 * num_q * cap].view(torch.int32).view(num_q, cap)
         origin, inv_delta = self._origin[:num_q], self._inv_delta[:num_q]
-        th_bucket, cand_cnt = self._th_bucket[:num_q], self._cand_cnt[:num_q]
-        health, bad_rows = self._health, self._bad_rows
+        th_bucket = self._th_bucket[:num_q]
         lo, hi = self._lo[:num_q], self._hi[:num_q]
         seed_topk = min(topk + SEED_MARGIN, cap)
         slack = GATE_SLACK * topk
@@ -310,13 +339,11 @@ class Selector:
 
         scope = launch.sm90_q_scope(q)
         with torch.cuda.device(q.device), scope:
-            launch.sample_scores(q, kv, kv_scales, weights, ks, ke, num_samples, sample, cand_cnt, lo, hi, health)
+            launch.sample_scores(q, kv, kv_scales, weights, ks, ke, num_samples, sample, cand_cnt, lo, hi, health,
+                                 self._sample_kv, self._sample_scales)
             launch.seed_prep(sample, ks, ke, lo, hi, seed_topk, slack, min(K_MIN, seed_topk), origin, inv_delta,
                              th_bucket, cand_cnt)
             gate = (origin, inv_delta, th_bucket, cand_val, cand_idx, cand_cnt)
-            mode = self.pruning
-            if mode == "adaptive" and not planner.adaptive_eligible(q, seq_len_kv):
-                mode = "off"
             if mode == "off":
                 launch.scan(q, kv, kv_scales, weights, ks, ke, *gate)
             elif mode == "always":
@@ -327,12 +354,26 @@ class Selector:
             else:
                 # The scan sees empty windows when the call prunes, the pruning kernels when it does not.
                 scan_ks, prune_ks = self._scan_ks[:num_q], self._prune_ks[:num_q]
-                plan = planner.adaptive_estimate(q, weights, kv, kv_scales, ks, ke, origin, inv_delta, th_bucket,
-                                                 self._flag, scan_ks, prune_ks, self._estimate)
+                three_way = planner.three_way_eligible(q, seq_len_kv)
+                prune24_ks = self._prune24_ks[:num_q] if three_way else None
+                plan = planner.adaptive_estimate(
+                    q, weights, kv, kv_scales, ks, ke, origin, inv_delta, th_bucket,
+                    self._flag, scan_ks, prune_ks, self._estimate, prune24_ks, use_eff_window=True,
+                )
                 estimate = self._estimate
                 launch.scan(q, kv, kv_scales, weights, scan_ks, ke, *gate)
                 q_prune, w_prune, allowance, knsc, _ = planner.adaptive_finish(plan, kv, self._flag)
-                launch.prune_scan(q, q_prune, kv, kv_scales, knsc, weights, w_prune, allowance, prune_ks, ke, *gate)
+                if three_way:
+                    mask = launch.prune_mask(q_prune, kv, kv_scales, knsc, w_prune, allowance, prune_ks, ke,
+                                             origin, inv_delta, th_bucket, flag=self._flag, expected_flag=1)
+                    q24, w24, _, _, _ = plan.operands(PRUNE_COLS_24)
+                    launch.prune_mask(q24, kv, kv_scales, knsc, w24, allowance, prune24_ks, ke,
+                                      origin, inv_delta, th_bucket, mask=mask, flag=self._flag, expected_flag=2)
+                    launch.prune_refine(q, kv, kv_scales, knsc, weights, mask, ks, ke, *gate,
+                                        flag=self._flag, expected_flag=-1)
+                else:
+                    launch.prune_scan(q, q_prune, kv, kv_scales, knsc, weights, w_prune, allowance, prune_ks, ke, *gate,
+                                      flag=self._flag, expected_flag=1)
                 pruned = self._flag
             launch.select(cand_val, cand_idx, cand_cnt, ks, ke, scores, indices, health, bad_rows)
             self._recovery.run(q, kv, kv_scales, weights, ks, ke, health, bad_rows, scores, indices)

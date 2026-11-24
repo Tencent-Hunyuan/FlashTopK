@@ -6,7 +6,7 @@ See the [README](../README.md) for the score, installation and a first call.
 
 - **Exact:** rows the sampled threshold misses are rescored on the GPU (recovery), so every row is the exact top-k. Recovery is always on.
 - **Deterministic:** ties at the k-th score keep the smallest key indices. The output is sorted by score, then by index.
-- **Adaptive key pruning:** from 128K keys, each call decides on the GPU whether to skip keys by a score bound (see [Configuration](#configuration)).
+- **Adaptive key pruning:** from 128K keys and 512 query rows, each call decides on the GPU whether to skip keys by a score bound (on SM100 from 256K keys, 3-way across full scan, 16-column, and 24-column pruning; see [Configuration](#configuration)).
 - **Asynchronous:** a call never synchronizes with the host. Selection carries no gradient.
 
 ## flashtopk.select
@@ -63,6 +63,7 @@ selector.run(q, kv, weights, ks, ke, kv_scales=None, out=None) -> indices, or (s
 selector.last_info
 """The last call's record. It stays on the GPU until read; reading synchronizes.
     pruned: bool. Whether the call pruned keys.
+    prune_cols: int. Pruning width taken by the call: 0 (full scan), 16, or 24.
     bad_rows: int. The rows recovery rescored.
     health: int64[8]. [0] rows whose candidates overflowed, [1] rows that came up short, [7] bad rows.
 """
@@ -96,7 +97,8 @@ flashtopk.supported(q, kv=None) -> bool
 ## Configuration
 
 - `FLASHTOPK_PRUNING`: `adaptive` (the default), `always` or `off`. `pruning=` sets it per selector.
-- `FLASHTOPK_PRUNE_COSTS="p,c,b"`: overrides this GPU's pruning cost model (see [Hardware and model support](hardware.md)).
+- `FLASHTOPK_PRUNE_COSTS="p,c,b"`: overrides this GPU's 16-column pruning cost model (see [Hardware and model support](hardware.md)).
+- `FLASHTOPK_PRUNE_COSTS_24="p,c,b"`: overrides SM100's 24-column pruning cost model.
 
 ## Training and context parallelism
 

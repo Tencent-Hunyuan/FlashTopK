@@ -45,6 +45,7 @@ import triton
 import triton.language as tl
 
 from .kernels import launch
+from .kernels.common import PRUNE_COLS_24
 from .kernels.prologue import EST_GROUP, EST_WORDS
 
 # The pruning kernels' columns per row: the retained heads and the negative aggregate's two rows.
@@ -72,12 +73,12 @@ assert EST_WORDS == 2 * (_PLAN_SAMPLES // 32)
 # constant gate planned FP8 aggregate rows and allowances differently (survival estimates up to 5x off, and twice the
 # refine work).
 @triton.jit
-def _operand_row(row, col, LAYOUT: tl.constexpr):
+def _operand_row(row, col, LAYOUT: tl.constexpr, NCOL: tl.constexpr):
     """Where row `row`, column `col` of the pruning operand goes: SM100 (LAYOUT 1) takes row pairs column by column,
     [pair, column, row of pair]; SM90 (LAYOUT 2) 16-row tiles permuted by prune_sm90.n_of (row 4b + a, column
     2d + e of a tile is operand row 64a + 8d + 2b + e)."""
     if LAYOUT == 1:
-        return (row // 2) * 32 + col * 2 + row % 2
+        return (row // 2) * (2 * NCOL) + col * 2 + row % 2
     else:
         r = row % 16
         return (row // 16) * 256 + 64 * (r % 4) + 8 * (col // 2) + 2 * (r // 4) + col % 2
@@ -89,7 +90,7 @@ def _estimate_row(row, G: tl.constexpr, stride):
     return (row // G) % stride == 0
 
 
-@triton.jit(do_not_specialize=["estimate", "gated", "stride"])
+@triton.jit(do_not_specialize=["estimate", "gated", "stride", "target_flag", "skip_est", "write_plan"])
 def _plan_kernel(
     Q,  # [num_q, H, 128] fp8 or bf16
     W,  # [num_q, H] fp32
@@ -106,13 +107,16 @@ def _plan_kernel(
     WS,  # [num_q, R + 2] fp32 out
     ALLOW,  # [num_q] fp32 out
     EST,  # [estimate rows, EST_WORDS] int32 out: per estimate row, its in-window and past-the-gate sample masks
-    FLAG,  # [1] int32, gated only: nonzero when the call prunes
+    FLAG,  # [1] int32, gated only: must equal target_flag for this plan to run
     num_q,
     padded,  # rows of the operand, num_q rounded up to its row group; the rows past num_q are zeroed
     rounding,
     estimate,  # nonzero: the estimate's rows only (program p is row p % G of estimate group p // G); else every row
-    gated,  # nonzero: the rest of an adaptive plan, the rows the estimate pass left, when FLAG is set
+    gated,  # nonzero: run only when FLAG == target_flag
     stride,  # the estimate's groups: one in this many (estimate_stride)
+    target_flag,  # FLAG value that enables this gated plan (1 for 16-col, 2 for 24-col)
+    skip_est,  # nonzero: skip estimate rows already written in the estimate pass
+    write_plan,  # nonzero: write QS/WS/ALLOW (0 for estimate-only 24-col pass sharing the operand buffer)
     H: tl.constexpr,
     R: tl.constexpr,
     S: tl.constexpr,
@@ -127,17 +131,17 @@ def _plan_kernel(
     est_row = _estimate_row(row, G, stride)
     d = tl.arange(0, 128)
     if gated != 0:
-        if (tl.load(FLAG) == 0) | est_row:
+        if (tl.load(FLAG) != target_flag) | ((skip_est != 0) & est_row):
             return
     if (estimate != 0) & (row >= num_q):
         # A group's rows past the call: no samples, so they leave the group's union alone.
         pad_slot = (row // (G * stride)) * G + row % G
         tl.store(EST + pad_slot * (S // 16) + tl.arange(0, S // 16), tl.zeros([S // 16], dtype=tl.int32))
     if row >= num_q:
-        if row < padded:
-            c = tl.arange(0, R + 2)
-            tl.store(QS + _operand_row(row, c, LAYOUT)[:, None] * 128 + d[None, :],
-                     tl.zeros([R + 2, 128], dtype=QS.dtype.element_ty))
+        if (write_plan != 0) & (row < padded):
+            c = tl.arange(0, H)
+            tl.store(QS + _operand_row(row, c, LAYOUT, R + 2)[:, None] * 128 + d[None, :],
+                     tl.zeros([H, 128], dtype=QS.dtype.element_ty), mask=(c < R + 2)[:, None])
         return
     h = tl.arange(0, H)
     q8 = tl.load(Q + row * H * 128 + h[:, None] * 128 + d[None, :])
@@ -250,14 +254,15 @@ def _plan_kernel(
         tl.store(EST + est_slot * (S // 16) + w8, win_words.to(tl.uint32).to(tl.int32, bitcast=True))
         tl.store(EST + est_slot * (S // 16) + S // 32 + w8, pass_words.to(tl.uint32).to(tl.int32, bitcast=True))
 
-    slot = tl.where(kept, rank, R)
-    tl.store(QS + _operand_row(row, slot, LAYOUT)[:, None] * 128 + d[None, :], q8, mask=kept[:, None])
-    tl.store(QS + _operand_row(row, R, LAYOUT) * 128 + d, a8_hi)
-    tl.store(QS + _operand_row(row, R + 1, LAYOUT) * 128 + d, a8_lo)
-    tl.store(WS + row * (R + 2) + slot, wt, mask=kept)
-    tl.store(WS + row * (R + 2) + R, scale_hi)
-    tl.store(WS + row * (R + 2) + R + 1, scale_lo)
-    tl.store(ALLOW + row, allow)
+    if write_plan != 0:
+        slot = tl.where(kept, rank, R)
+        tl.store(QS + _operand_row(row, slot, LAYOUT, R + 2)[:, None] * 128 + d[None, :], q8, mask=kept[:, None])
+        tl.store(QS + _operand_row(row, R, LAYOUT, R + 2) * 128 + d, a8_hi)
+        tl.store(QS + _operand_row(row, R + 1, LAYOUT, R + 2) * 128 + d, a8_lo)
+        tl.store(WS + row * (R + 2) + slot, wt, mask=kept)
+        tl.store(WS + row * (R + 2) + R, scale_hi)
+        tl.store(WS + row * (R + 2) + R + 1, scale_lo)
+        tl.store(ALLOW + row, allow)
 
 
 @triton.jit
@@ -297,20 +302,25 @@ def _plan_sample_cols(nk: int, device_index: int) -> Tuple[torch.Tensor, torch.T
 
 
 class _Plan:
-    """Buffers and sample keys of one call's pruning plan."""
+    """Buffers and sample keys of one call's pruning plan (supports optional 3-way 16/24-col adaptive on SM100)."""
 
-    def __init__(self, q, weights, kv, kv_scales, ks, ke, origin, inv_delta, th_bucket):
-        num_q, heads, dim = q.shape
+    def __init__(self, q, weights, kv, kv_scales, ks, ke, origin, inv_delta, th_bucket, *,
+                 cols: int = PRUNE_COLUMNS, three_way: bool = False):
+        num_q, _, dim = q.shape
         nk = kv.shape[0]
         dev = q.device
+        self.three_way = three_way
+        self.ncols = cols
+        self.alloc_cols = PRUNE_COLS_24 if three_way else cols
         self.layout = 2 if torch.cuda.get_device_capability(dev)[0] == 9 else 1
         group = 16 if self.layout == 2 else 2
         self.padded = triton.cdiv(num_q, group) * group
-        self.q_prune = torch.empty(self.padded * PRUNE_COLUMNS, dim, dtype=q.dtype, device=dev)
-        self.w_prune = torch.empty(num_q, PRUNE_COLUMNS, dtype=torch.float32, device=dev)
+        self.q_prune = torch.empty(self.padded * self.alloc_cols, dim, dtype=q.dtype, device=dev)
+        self.w_prune = torch.empty(num_q * self.alloc_cols, dtype=torch.float32, device=dev)
         self.allowance = torch.empty(num_q, dtype=torch.float32, device=dev)
         self.est_rows = estimate_rows(num_q)
         self.est = torch.empty(self.est_rows, EST_WORDS, dtype=torch.int32, device=dev)
+        self.est24 = torch.empty(self.est_rows, EST_WORDS, dtype=torch.int32, device=dev) if three_way else None
         if th_bucket is None:
             origin = torch.zeros(num_q, dtype=torch.float32, device=dev)
             inv_delta = torch.zeros(num_q, dtype=torch.float32, device=dev)
@@ -334,24 +344,38 @@ class _Plan:
         self.kv_scales = kv_scales
         self.args = (q, weights, ks, ke, origin, inv_delta, th_bucket)
 
-    def rows(self, num_q: int, estimate: bool, flag: Optional[torch.Tensor]) -> None:
-        """Plan the estimate groups' rows (estimate), else every row; with ``flag``, the rows the estimate pass left,
-        if it is set."""
+    def rows(self, num_q: int, estimate: bool, flag: Optional[torch.Tensor], *,
+             cols: Optional[int] = None, target_flag: int = 1, skip_est: bool = True, write_plan: bool = True) -> None:
+        """Plan the estimate groups' rows (estimate), else every row; with ``flag``, run only when
+        ``flag == target_flag``."""
         q, weights, ks, ke, origin, inv_delta, th_bucket = self.args
+        c = self.ncols if cols is None else cols
+        est_buf = self.est24 if (c == PRUNE_COLS_24 and self.est24 is not None) else self.est
+        q_view = self.q_prune[: self.padded * c]
+        w_view = self.w_prune[: num_q * c].view(num_q, c)
         _plan_kernel[(self.est_rows if estimate else self.padded,)](
             q, weights, self.k_samples, self.s_samples, self.knsc_samples, self.cols, ks, ke, origin, inv_delta,
-            th_bucket, self.q_prune, self.w_prune, self.allowance, self.est, ks if flag is None else flag,
+            th_bucket, q_view, w_view, self.allowance, est_buf, ks if flag is None else flag,
             num_q, self.padded, SCREEN_ROUNDING + _PLAN_ROUNDING, int(estimate), int(flag is not None),
-            estimate_stride(num_q), H=q.shape[1], R=PRUNE_COLUMNS - 2, S=_PLAN_SAMPLES, G=EST_GROUP, BF16=self.bf16,
-            LAYOUT=self.layout, num_warps=4,
+            estimate_stride(num_q), target_flag, int(skip_est), int(write_plan),
+            H=q.shape[1], R=c - 2, S=_PLAN_SAMPLES, G=EST_GROUP, BF16=self.bf16,
+            LAYOUT=self.layout, num_warps=4, num_stages=1,
         )
 
     def scales_or(self, kv: torch.Tensor) -> torch.Tensor:
         """The kv scales for the key-norm kernel; any float tensor for BF16 keys (HAS_SCALES off, never read)."""
         return self.knsc if self.kv_scales is None else self.kv_scales
 
-    def operands(self):
-        return self.q_prune, self.w_prune, self.allowance, self.knsc, self.est
+    def operands(self, cols: Optional[int] = None):
+        c = self.ncols if cols is None else cols
+        num_q = self.args[0].shape[0]
+        return (
+            self.q_prune[: self.padded * c],
+            self.w_prune[: num_q * c].view(num_q, c),
+            self.allowance,
+            self.knsc,
+            self.est24 if (c == PRUNE_COLS_24 and self.est24 is not None) else self.est,
+        )
 
 
 def estimate_stride(num_q: int) -> int:
@@ -380,18 +404,25 @@ def estimate_shares(est: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
 
 
 
-# Adaptive pruning: from ADAPTIVE_MIN_KEYS keys every call plans the estimate's rows, and the GPU picks pruning or the
-# scan from that call's estimate. Below it the scan is ahead whatever the estimate.
+# Adaptive pruning: from ADAPTIVE_MIN_KEYS keys and ADAPTIVE_MIN_ROWS rows every call plans the estimate's rows,
+# and the GPU picks scan / 16-col / 24-col from that call's estimate. Below these thresholds the scan is ahead.
 ADAPTIVE_MIN_KEYS = 128 * 1024
+ADAPTIVE_MIN_ROWS = 512
+THREE_WAY_MIN_KEYS = 256 * 1024
 
 # Pruning's kernels over the scan's, per call: p * 128K / L (key norms and the plan, per row as the scan is per key)
 # + c (the mask, a fixed share, and the refine's fixed part) + b * U (the refine of the kept share U of the row
-# groups' windows: estimate_shares' union). Least squares over each stage's measured times on trained and
-# initialized indexers and random weights and keys, per device and operand type; a device not listed takes the entry
-# of its architecture's ARCH_DEVICE.
+# groups' windows: estimate_shares' union). Keys are (device, dtype) for 16-col and (device, dtype, 24) for SM100
+# 24-col; a device not listed takes the entry of its architecture's ARCH_DEVICE.
 PRUNE_COSTS = {
-    ("B200", "fp8"): (0.0823, 0.6094, 1.7193),
-    ("B200", "bf16"): (0.2130, 0.6015, 1.7920),
+    ("B200", "fp8"): (0.1683, 0.5277, 1.7035),
+    ("B200", "bf16"): (0.1581, 0.5606, 1.8229),
+    ("B200", "fp8", 24): (0.0961, 0.8150, 1.7720),
+    ("B200", "bf16", 24): (0.0901, 0.8073, 1.9511),
+    ("GB300", "fp8"): (0.0162, 0.6059, 2.2516),
+    ("GB300", "bf16"): (0.0618, 0.6000, 2.0606),
+    ("GB300", "fp8", 24): (0.0387, 0.8690, 1.7092),
+    ("GB300", "bf16", 24): (0.0705, 0.8225, 1.6576),
     ("H800", "fp8"): (0.0262, 0.5296, 1.4184),
     ("H800", "bf16"): (0.0095, 0.5334, 1.3627),
     ("H20", "fp8"): (0.0272, 0.5098, 1.0018),
@@ -405,67 +436,93 @@ ARCH_DEVICE = {10: "B200", 9: "H800"}
 
 
 def adaptive_eligible(q: torch.Tensor, seq_len_kv: int) -> bool:
-    """Whether the GPU chooses per call (from ADAPTIVE_MIN_KEYS keys); shorter calls scan."""
-    return seq_len_kv >= ADAPTIVE_MIN_KEYS
+    """Whether the GPU chooses per call (from ADAPTIVE_MIN_KEYS keys and ADAPTIVE_MIN_ROWS rows); smaller calls scan."""
+    return seq_len_kv >= ADAPTIVE_MIN_KEYS and q.shape[0] >= ADAPTIVE_MIN_ROWS
+
+
+def three_way_eligible(q: torch.Tensor, seq_len_kv: int) -> bool:
+    """Whether SM100 adaptive pruning evaluates both 16-col and 24-col bounds."""
+    return seq_len_kv >= THREE_WAY_MIN_KEYS and launch.arch(q) == 10
 
 
 @functools.lru_cache(maxsize=None)
-def prune_costs(device_index: int, bf16: bool) -> Tuple[float, float, float]:
-    """(p, c, b) of PRUNE_COSTS for this GPU; FLASHTOPK_PRUNE_COSTS="p,c,b" overrides."""
-    env = os.environ.get("FLASHTOPK_PRUNE_COSTS")
+def prune_costs(device_index: int, bf16: bool, cols: int = PRUNE_COLUMNS) -> Tuple[float, float, float]:
+    """(p, c, b) of PRUNE_COSTS for this GPU; FLASHTOPK_PRUNE_COSTS / FLASHTOPK_PRUNE_COSTS_24="p,c,b" overrides."""
+    env = os.environ.get("FLASHTOPK_PRUNE_COSTS_24" if cols == PRUNE_COLS_24 else "FLASHTOPK_PRUNE_COSTS")
     if env:
         p, c, b = (float(x) for x in env.split(","))
         return p, c, b
     words = set(torch.cuda.get_device_name(device_index).split())
     kind = "bf16" if bf16 else "fp8"
-    for (device, dtype), costs in PRUNE_COSTS.items():
-        if device in words and dtype == kind:
+    cap = torch.cuda.get_device_capability(device_index)
+    arch_dev = "GB300" if cap >= (10, 3) else ARCH_DEVICE.get(cap[0], "H800")
+    if cols != PRUNE_COLUMNS:
+        for key, costs in PRUNE_COSTS.items():
+            if len(key) == 3 and key[0] in words and key[1] == kind and key[2] == cols:
+                return costs
+        if (arch_dev, kind, cols) in PRUNE_COSTS:
+            return PRUNE_COSTS[(arch_dev, kind, cols)]
+    for key, costs in PRUNE_COSTS.items():
+        if len(key) == 2 and key[0] in words and key[1] == kind:
             return costs
-    return PRUNE_COSTS[(ARCH_DEVICE.get(torch.cuda.get_device_capability(device_index)[0], "H800"), kind)]
+    return PRUNE_COSTS[(arch_dev, kind)]
 
 
 @functools.lru_cache(maxsize=4096)
-def adaptive_threshold(device_index: int, bf16: bool, seq_len_kv: int) -> float:
+def adaptive_threshold(device_index: int, bf16: bool, seq_len_kv: int, cols: int = PRUNE_COLUMNS) -> float:
     """The group estimate at or below which a call prunes: where pruning's predicted cost meets the scan's,
     p * 128K / L + c + b * U = 1."""
-    p, c, b = prune_costs(device_index, bf16)
+    p, c, b = prune_costs(device_index, bf16, cols)
     return min(max((1.0 - p * 131072 / seq_len_kv - c) / b, 0.0), 1.0)
 
 
 def adaptive_estimate(q, weights, kv, kv_scales, ks, ke, origin, inv_delta, th_bucket, flag, scan_ks, prune_ks,
-                      estimate=None):
-    """The plan of the estimate groups' rows, then the GPU's choice: ``flag`` (int32[1]) set when this call's group
-    estimate is at or below ``adaptive_threshold``, ``scan_ks`` / ``prune_ks`` the windows' starts for the scan and
-    for the pruning kernels (the row's own on the path chosen, past its end on the other); ``estimate`` (FP32[1]),
-    when given, receives the estimate. Returns the plan, which ``adaptive_finish`` completes."""
-    num_q = q.shape[0]
-    plan = _Plan(q, weights, kv, kv_scales, ks, ke, origin, inv_delta, th_bucket)
+                      estimate=None, prune24_ks=None, *, use_eff_window: bool = False):
+    """The plan of the estimate groups' rows, then the GPU's choice: ``flag`` (int32[1]) = 0 (scan), 1 (16-col
+    pruning), or 2 (24-col pruning when ``prune24_ks`` is provided); ``scan_ks`` / ``prune_ks`` / ``prune24_ks``
+    receive the row's own start on the chosen path and ``ke`` on the others."""
+    num_q, seq_len_kv = q.shape[0], kv.shape[0]
+    three_way = prune24_ks is not None
+    plan = _Plan(q, weights, kv, kv_scales, ks, ke, origin, inv_delta, th_bucket, three_way=three_way)
     plan.rows(num_q, True, None)
-    threshold = adaptive_threshold(q.device.index, kv_scales is None, kv.shape[0])
-    launch.decide(plan.est, ks, ke, scan_ks, prune_ks, flag, threshold, estimate)
+    if three_way:
+        # Estimate-only pass for R=22: leaves the R=14 estimate rows intact in q_prune[:padded*16].
+        plan.rows(num_q, True, None, cols=PRUNE_COLS_24, write_plan=False)
+    p16, c16, b16 = prune_costs(q.device.index, kv_scales is None)
+    p24, c24, b24 = prune_costs(q.device.index, kv_scales is None, PRUNE_COLS_24) if three_way else (0.0, 0.0, 0.0)
+    launch.decide(
+        plan.est, plan.est24 if three_way else plan.est, ks, ke, scan_ks, prune_ks,
+        prune24_ks if three_way else prune_ks, flag, seq_len_kv,
+        p16, c16, b16, p24, c24, b24,
+        estimate, three_way=three_way, use_eff_window=use_eff_window,
+    )
     return plan
 
 
 def adaptive_finish(plan, kv, flag):
-    """The pruning kernels' operands: the key norms and the rows the estimate left, planned only when the call
-    prunes (flag set). Enqueued after the scan, whose launch then waits for none of it."""
+    """The pruning kernels' operands: key norms (when flag != 0) and the remaining rows for the chosen width.
+    Enqueued after the scan, whose launch then waits for none of it."""
     key_norms(plan, kv, flag)
-    plan.rows(plan.args[0].shape[0], False, flag)
+    num_q = plan.args[0].shape[0]
+    plan.rows(num_q, False, flag, target_flag=1, skip_est=True, write_plan=True)
+    if plan.three_way:
+        plan.rows(num_q, False, flag, cols=PRUNE_COLS_24, target_flag=2, skip_est=False, write_plan=True)
     return plan.operands()
 
 
 @torch.no_grad()
-def plan_operands(q, weights, kv, kv_scales, ks, ke, origin=None, inv_delta=None, th_bucket=None):
+def plan_operands(q, weights, kv, kv_scales, ks, ke, origin=None, inv_delta=None, th_bucket=None,
+                  cols: int = PRUNE_COLUMNS):
     """``(q_prune, w_prune, allowance, knsc, est)`` for every row: the always-prune plan.
 
     ``q_prune`` (FP8 or BF16): per row the retained heads' rows of ``q``, then the aggregate's high and low rows, laid
-    out as the pruning kernel reads them (``_operand_row``); ``w_prune`` ``[num_q, 16]`` FP32: the folded weights,
-    then the two rows' scales. The bound is ``s_k * (sum_j w_j relu(q_j . k) - relu(w_14 q_14 . k + w_15 q_15 . k)
+    out as the pruning kernel reads them (``_operand_row``); ``w_prune`` ``[num_q, cols]`` FP32: the folded weights,
+    then the two rows' scales. The bound is ``s_k * (sum_j w_j relu(q_j . k) - relu(w_R q_R . k + w_{R+1} q_{R+1} . k)
     + allowance ||k||)``. ``knsc`` ``[seq_len_kv]``: ``scale * ||k||`` rounded up; ``est``: the estimate rows'
     sample masks (``estimate_shares``).
     """
     num_q = q.shape[0]
-    plan = _Plan(q, weights, kv, kv_scales, ks, ke, origin, inv_delta, th_bucket)
+    plan = _Plan(q, weights, kv, kv_scales, ks, ke, origin, inv_delta, th_bucket, cols=cols)
     key_norms(plan, kv)
-    plan.rows(num_q, False, None)
-    return plan.operands()
+    plan.rows(num_q, False, None, cols=cols)
+    return plan.operands(cols=cols)

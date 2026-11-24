@@ -54,7 +54,7 @@ from .common import (
     select_i32,
     store_global_b32,
 )
-from .scan_sm100 import _RND_RN, NUM_W_IN_REG, i32_bits_to_fp32, named_barrier_sync_unaligned
+from .scan_sm100 import _RND_RN, i32_bits_to_fp32, named_barrier_sync_unaligned
 
 BLOCK_KV = 128
 BLOCK_Q = 8
@@ -64,6 +64,7 @@ NUM_TILES = 4
 MAX_BLOCKS = 16384  # KV blocks a CTA's range may span: its survivor prefix is in shared memory
 MAX_BLOCKS_BF16 = 4096  # BF16 compact tiles are twice as large: a shorter prefix keeps shared memory under 227 KB
 NUM_EPI_SUBTILES = 4
+NUM_W_IN_REG = 8  # 64 floats in registers keeps math warps below 216 regs (cuts local spills by 99.5%)
 
 
 def _swizzled(slot, chunk):
@@ -122,10 +123,12 @@ class RefineSm100:
         cand_val: cute.Tensor,
         cand_idx: cute.Tensor,
         cand_cnt: cute.Tensor,
+        flag: cute.Tensor,  # [1] i32: adaptive choice flag (ignored when expected_flag == 0)
         num_q: Int32,
         seq_len_kv: Int32,
         mask_blocks: Int32,
         num_splits: Int32,
+        expected_flag: Int32,  # 0: always run; -1: run iff flag[0] != 0; >0: run iff flag[0] == expected_flag
         stream: cuda.CUstream,
     ):
         b = q if cutlass.const_expr(self.bf16) else cute.recast_tensor(q, cutlass.Float8E4M3FN)
@@ -150,8 +153,8 @@ class RefineSm100:
         num_tiles = (num_q + BLOCK_Q - 1) // BLOCK_Q
         self.kernel(
             tiled_mma, tma_atom_b, tma_tensor_b, tma_atom_w, tma_tensor_w, kv, kv_scales, mask, row_start, row_end,
-            origin, inv_delta, th_bucket, cand_val, cand_idx, cand_cnt, num_q, seq_len_kv, mask_blocks, num_splits,
-            self.a_smem_layout_staged, self.b_smem_layout_staged, SharedStorage,
+            origin, inv_delta, th_bucket, cand_val, cand_idx, cand_cnt, flag, num_q, seq_len_kv, mask_blocks,
+            num_splits, expected_flag, self.a_smem_layout_staged, self.b_smem_layout_staged, SharedStorage,
         ).launch(grid=(num_tiles, num_splits, 1), block=[self.threads_per_cta, 1, 1], min_blocks_per_mp=1, stream=stream)
 
     @cute.kernel
@@ -173,10 +176,12 @@ class RefineSm100:
         mCandVal: cute.Tensor,
         mCandIdx: cute.Tensor,
         mCandCnt: cute.Tensor,
+        mFlag: cute.Tensor,
         num_q: Int32,
         seq_len_kv: Int32,
         mask_blocks: Int32,
         num_splits: Int32,
+        expected_flag: Int32,
         a_smem_layout_staged: cute.ComposedLayout,
         b_smem_layout_staged: cute.ComposedLayout,
         SharedStorage: cutlass.Constexpr,
@@ -189,23 +194,30 @@ class RefineSm100:
         tile = gdimx - 1 - bidx
         query_start = tile * BLOCK_Q
 
+        # Skip per-row window loads when adaptive pruning chose full scan (or another branch).
+        flag_ok = expected_flag == Int32(0)
+        if expected_flag != Int32(0):
+            fval = mFlag[0]
+            flag_ok = select_i32(expected_flag < Int32(0), fval != Int32(0), fval == expected_flag) != Int32(0)
         total_blocks = (seq_len_kv + BLOCK_KV - 1) // BLOCK_KV
         blocks_per_split = (total_blocks + num_splits - 1) // num_splits
         split_lo = bidy * blocks_per_split * BLOCK_KV
         split_hi = min((bidy + 1) * blocks_per_split * BLOCK_KV, seq_len_kv)
         range_lo = seq_len_kv
         range_hi = Int32(0)
-        for r in cutlass.range_constexpr(BLOCK_Q):
-            row = query_start + r
-            s = seq_len_kv
-            e = Int32(0)
-            if row < num_q:
-                s = max(min(mRowStart[row], seq_len_kv), split_lo)
-                e = min(min(mRowEnd[row], seq_len_kv), split_hi)
-            nonempty = e > s
-            range_lo = min(range_lo, select_i32(nonempty, s, seq_len_kv))
-            range_hi = max(range_hi, select_i32(nonempty, e, 0))
-        has_work = range_hi > range_lo
+        has_work = cutlass.Boolean(False)
+        if flag_ok:
+            for r in cutlass.range_constexpr(BLOCK_Q):
+                row = query_start + r
+                s = seq_len_kv
+                e = Int32(0)
+                if row < num_q:
+                    s = max(min(mRowStart[row], seq_len_kv), split_lo)
+                    e = min(min(mRowEnd[row], seq_len_kv), split_hi)
+                nonempty = e > s
+                range_lo = min(range_lo, select_i32(nonempty, s, seq_len_kv))
+                range_hi = max(range_hi, select_i32(nonempty, e, 0))
+            has_work = range_hi > range_lo
         kv_start = range_lo // BLOCK_KV * BLOCK_KV
         nb = Int32(0)
         if has_work:
@@ -261,7 +273,7 @@ class RefineSm100:
                     s = max(min(mRowStart[row_q], seq_len_kv), split_lo)
                     e = min(min(mRowEnd[row_q], seq_len_kv), split_hi)
                 sWin[(tidx, 0)] = s
-                sWin[(tidx, 1)] = max(e - s, Int32(0))
+                sWin[(tidx, 1)] = e
             cute.arch.sync_threads()
 
             tmem = utils.TmemAllocator(
@@ -517,9 +529,7 @@ class RefineSm100:
                     raw = cute.arch.mul_packed_f32x2((scale, scale), (red[r], red[r + 1]), rnd=_RND_RN)
                     for i in cutlass.range_constexpr(2):
                         row = r + i
-                        take = valid & (raw[i] > sGate[row]) & (
-                            cutlass.Uint32(kv_idx - sWin[(row, 0)]) < cutlass.Uint32(sWin[(row, 1)])
-                        )
+                        take = valid & (raw[i] > sGate[row]) & (kv_idx >= sWin[(row, 0)]) & (kv_idx < sWin[(row, 1)])
                         masks.append((cutlass.Uint32(cute.arch.vote_ballot_sync(take)), raw[i]))
                 # Every row's slots in one round trip: lane r reserves row r's.
                 lane_rows = cutlass.Uint32(0)

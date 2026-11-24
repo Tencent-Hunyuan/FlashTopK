@@ -11,6 +11,8 @@ from cutlass import Float32, Int32
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import dsl_user_op
 
+from .common import fmax, fmin
+
 THREADS = 256
 WARPS = THREADS // 32
 
@@ -120,6 +122,45 @@ def fence_gpu(*, loc=None, ip=None) -> None:
 
 
 @dsl_user_op
+def store_shared_v4_b32(smem_addr, v0, v1, v2, v3, *, loc=None, ip=None) -> None:
+    """One 16-byte shared-memory vector store."""
+    llvm.inline_asm(
+        None,
+        [
+            Int32(smem_addr).ir_value(loc=loc, ip=ip),
+            Int32(v0).ir_value(loc=loc, ip=ip),
+            Int32(v1).ir_value(loc=loc, ip=ip),
+            Int32(v2).ir_value(loc=loc, ip=ip),
+            Int32(v3).ir_value(loc=loc, ip=ip),
+        ],
+        "st.shared.v4.b32 [$0], {$1, $2, $3, $4};",
+        "r,r,r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def load_shared_v4_b32(smem_addr, *, loc=None, ip=None):
+    """One 16-byte shared-memory vector load (four raw 32-bit ints)."""
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([Int32.mlir_type] * 4),
+        [Int32(smem_addr).ir_value(loc=loc, ip=ip)],
+        "ld.shared.v4.b32 {$0, $1, $2, $3}, [$4];",
+        "=r,=r,=r,=r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return tuple(Int32(llvm.extractvalue(Int32.mlir_type, result, [i], loc=loc, ip=ip)) for i in range(4))
+
+
+@dsl_user_op
 def f32_bits(x, *, loc=None, ip=None) -> cutlass.Uint32:
     return cutlass.Uint32(llvm.bitcast(cutlass.Uint32.mlir_type, Float32(x).ir_value(loc=loc, ip=ip), loc=loc, ip=ip))
 
@@ -187,6 +228,38 @@ def block_max_i32(value, sScratch, tid) -> Int32:
     m = sScratch[0]
     for w in cutlass.range_constexpr(1, WARPS):
         m = max(m, sScratch[w])
+    cute.arch.sync_threads()
+    return m
+
+
+@cute.jit
+def block_min_f32(value, sScratch, tid) -> Float32:
+    """The minimum float32 over the block's THREADS threads (every thread gets it); sScratch holds WARPS floats."""
+    v = value
+    for off in cutlass.range_constexpr(5):
+        v = fmin(v, cute.arch.shuffle_sync_bfly(v, 1 << off))
+    if tid % 32 == 0:
+        sScratch[tid // 32] = v
+    cute.arch.sync_threads()
+    m = sScratch[0]
+    for w in cutlass.range_constexpr(1, WARPS):
+        m = fmin(m, sScratch[w])
+    cute.arch.sync_threads()
+    return m
+
+
+@cute.jit
+def block_max_f32(value, sScratch, tid) -> Float32:
+    """The maximum float32 over the block's THREADS threads (every thread gets it); sScratch holds WARPS floats."""
+    v = value
+    for off in cutlass.range_constexpr(5):
+        v = fmax(v, cute.arch.shuffle_sync_bfly(v, 1 << off))
+    if tid % 32 == 0:
+        sScratch[tid // 32] = v
+    cute.arch.sync_threads()
+    m = sScratch[0]
+    for w in cutlass.range_constexpr(1, WARPS):
+        m = fmax(m, sScratch[w])
     cute.arch.sync_threads()
     return m
 

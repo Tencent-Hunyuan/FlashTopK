@@ -49,7 +49,7 @@ How each method splits a full prefill:
 
 ![FlashTopK against public top-k selectors on a trained indexer, H20](../assets/performance_trained_h20.png)
 
-FlashTopK is the fastest at every length, GPU and operand type, and its lead grows with the length: on SM100 FP8, 2.1x the baseline at 128K and 3.3x at 1M. HPC-Ops and DeepSelect keep the score table and stay at 1.1-1.9x; DoSA reaches 2.3-2.4x from 768K.
+FlashTopK is the fastest at every length, GPU and operand type, and its lead grows with the length: on SM100 FP8, 2.2x the baseline at 128K and 3.3x at 1M. HPC-Ops and DeepSelect keep the score table and stay at 1.1-1.9x; DoSA reaches 2.3-2.4x from 768K.
 
 ### Untrained indexer
 
@@ -81,12 +81,12 @@ FlashTopK / dense scoring + FlashInfer top-k on the trained indexer (the median 
 
 | length | SM100 FP8 | SM100 BF16 | H800 FP8 | H800 BF16 | H20 FP8 | H20 BF16 |
 |---:|---:|---:|---:|---:|---:|---:|
-| 128K | 39.7 / 83.4 ms | 57.1 / 131 ms | 68.2 / 148 ms | 101 / 241 ms | 200 / 350 ms | 371 / 645 ms |
-| 192K | 77.6 / 190 ms | 117 / 284 ms | 134 / 322 ms | 195 / 528 ms | 399 / 782 ms | 753 / 1454 ms |
-| 256K | 126 / 338 ms | 184 / 508 ms | 216 / 565 ms | 319 / 928 ms | 662 / 1384 ms | 1264 / 2574 ms |
-| 512K | 420 / 1352 ms | 637 / 2053 ms | 738 / 2213 ms | 1119 / 3636 ms | 2394 / 5488 ms | 4.66 / 10.4 s |
-| 768K | 906 / 3061 ms | 1405 / 4541 ms | 1617 / 4925 ms | 2479 / 8115 ms | 5.33 / 12.4 s | 10.4 / 23.1 s |
-| 1M | 1623 / 5317 ms | 2532 / 8261 ms | 2912 / 8580 ms | 4.46 / 14.3 s | 9.55 / 22.7 s | 18.8 / 42.5 s |
+| 128K | 38.1 / 83.4 ms | 54.9 / 131 ms | 68.2 / 148 ms | 101 / 241 ms | 200 / 350 ms | 371 / 645 ms |
+| 192K | 75.2 / 190 ms | 119 / 284 ms | 134 / 322 ms | 195 / 528 ms | 399 / 782 ms | 753 / 1454 ms |
+| 256K | 125 / 338 ms | 179 / 508 ms | 216 / 565 ms | 319 / 928 ms | 662 / 1384 ms | 1264 / 2574 ms |
+| 512K | 417 / 1352 ms | 628 / 2053 ms | 738 / 2213 ms | 1119 / 3636 ms | 2394 / 5488 ms | 4.66 / 10.4 s |
+| 768K | 913 / 3061 ms | 1403 / 4541 ms | 1617 / 4925 ms | 2479 / 8115 ms | 5.33 / 12.4 s | 10.4 / 23.1 s |
+| 1M | 1620 / 5317 ms | 2497 / 8261 ms | 2912 / 8580 ms | 4.46 / 14.3 s | 9.55 / 22.7 s | 18.8 / 42.5 s |
 
 ## Run the benchmark
 
